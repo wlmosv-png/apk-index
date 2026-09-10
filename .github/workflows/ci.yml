@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: install
+        run: pip install -e . pytest
+
+      - name: unittest contract suites (render + httpd)
+        run: python3 -m pytest -q tests/ -o "python_functions=test_*"
+
+      - name: tools suite (33 cases, standalone)
+        run: python3 tests/test_tools.py
