@@ -1,0 +1,10 @@
+apk-index — 维护者
+
+wlmosv-png  <https://github.com/wlmosv-png>
+  设计与实现（全部源码、测试、文档）
+
+第三方组件（可选依赖，均不随本仓库分发）
+  jadx       —— 提供 Java 反编译视图（APK_INDEX_JADX_HOME）
+  baksmali   —— 提供 smali 视图（APK_INDEX_BAKSMALI_JAR）
+  androguard —— 可选索引后端（APK_INDEX_BACKEND=androguard）
+  dexlib2    —— 可选索引后端（APK_INDEX_BACKEND=dexlib2）

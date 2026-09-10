@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 索引与运行期产物（体积大、含被分析样本的结构数据，绝不入库）
+.cache/
+.calib/
+.testtmp/
+.diag*/
+.t[0-9]*/
+*.db
+*.db-journal
+httpd-android.log
+service-boot.log
+
+# 被分析的样本一律不入库
+*.apk
+*.aab
+*.aar
+*.dex
+*.jar
+*.vdex
+*.odex
+!fixtures/*.apk
+!fixtures/*.aar
+!fixtures/*.dex
+!fixtures/*.jar
+!fixtures/*.vdex
+!fixtures/split-demo/**
+
+.vips
+.env

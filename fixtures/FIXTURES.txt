@@ -1,0 +1,9 @@
+aar	fixtures/lib-http-1.4.0.aar	3482
+bareDex	fixtures/bare.dex	2196
+cdxVdex	fixtures/cdx.vdex	4123
+demoV1	fixtures/demo-v1.apk	4753
+demoV2	fixtures/demo-v2.apk	3685
+embeddedJar	fixtures/embedded.jar	1897
+packed	fixtures/packed.apk	7679
+splitDir	fixtures/split-demo/com.example.demo	-1
+vdex	fixtures/payload.vdex	2316

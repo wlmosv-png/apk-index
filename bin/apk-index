@@ -1,0 +1,32 @@
+#!/bin/sh
+# apk-index -- MCP stdio server launcher (POSIX sh, no build step needed).
+#
+# Env: APK_INDEX_PYTHON  which interpreter to use (default: python3 on PATH)
+#      ALLOWED_ROOTS     ':'-separated path whitelist for tool `path` args
+#      CACHE_DIR         where the SQLite index lives (default ~/.cache/apk-index)
+#      JADX_HOME         optional, enables decompile(format="java")
+#      BAKSALI_JAR       optional, enables decompile(format="smali") real smali
+#      APK_INDEX_BACKEND builtin | androguard | dexlib2 (default builtin)
+set -e
+SELF=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$SELF/.." && pwd)
+
+PY=$APK_INDEX_PYTHON
+if [ -z "$PY" ]; then
+  for c in python3 python3.13 python3.12 python3.11 python; do
+    if command -v "$c" >/dev/null 2>&1; then PY=$c; break; fi
+  done
+fi
+if [ -z "$PY" ]; then
+  echo "apk-index: 找不到 python3（>=3.9）。设置 APK_INDEX_PYTHON 指向解释器。" >&2
+  exit 3
+fi
+
+PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+case "$1" in
+  tools|call|pull|sessions|doctor)
+    exec "$PY" -m apkindex.cli "$@" ;;
+esac
+
+exec "$PY" -m apkindex.server "$@"

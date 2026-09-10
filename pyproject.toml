@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apk-index"
+version = "0.4.4"
+description = "本地 APK/AAR/DEX 索引与结构化检索的 MCP Server（纯标准库，零运行时依赖）"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "wlmosv-png" }]
+keywords = ["apk", "dex", "android", "mcp", "xposed", "reverse-engineering", "index"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/wlmosv-png/apk-index"
+Repository = "https://github.com/wlmosv-png/apk-index"
+
+
+[project.scripts]
+apk-index = "apkindex.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
