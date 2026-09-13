@@ -1,6 +1,6 @@
 # apk-index
 
-[![M8ven Score](https://m8ven.ai/badge/mcp/wlmosv-png/apk-index)](https://m8ven.ai/mcp/wlmosv-png/apk-index)
+
 
 [![M8ven Live Monitored](https://m8ven.ai/badge/mcp/wlmosv-png-apk-index-1janc3)](https://m8ven.ai/mcp/wlmosv-png-apk-index-1janc3)
 
