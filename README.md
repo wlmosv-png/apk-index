@@ -1,5 +1,8 @@
 # apk-index
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/wlmosv-png/apk-index)](https://m8ven.ai/mcp/wlmosv-png/apk-index)
+
+
 本地跑的 **APK / AAR / DEX 结构索引 + MCP Server**。17 个工具，纯 Python 标准库，零运行时依赖。
 
 给它一个安装包，它把类、方法、字段、字符串常量、注解、继承关系、调用引用全部落进一个可查询的
