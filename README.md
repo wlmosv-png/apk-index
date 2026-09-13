@@ -2,6 +2,8 @@
 
 [![M8ven Score](https://m8ven.ai/badge/mcp/wlmosv-png/apk-index)](https://m8ven.ai/mcp/wlmosv-png/apk-index)
 
+[![M8ven Live Monitored](https://m8ven.ai/badge/mcp/wlmosv-png-apk-index-1janc3)](https://m8ven.ai/mcp/wlmosv-png-apk-index-1janc3)
+
 
 本地跑的 **APK / AAR / DEX 结构索引 + MCP Server**。17 个工具，纯 Python 标准库，零运行时依赖。
 
