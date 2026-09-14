@@ -36,3 +36,25 @@ sys.exit(0 if want in names else 1)
 PYCHECK
   then echo "  含 $must"; else echo "  缺 $must" >&2; exit 1; fi
 done
+
+# 动态自检：server.py 里 import 的 apkindex 子模块必须全部在包里。
+# 教训：0.5.0 的 resource.py 没进发布包，server.py 引用 resource_mod 线上直接挂。
+# 只查固定清单查不出这类漏网——从 import 语句反推包内依赖。
+python3 - "$OUT" <<'PYCHECK'
+import re, sys, tarfile
+out = sys.argv[1]
+t = tarfile.open(out)
+names = {n.split("/", 1)[1] for n in t.getnames() if "/" in n}
+srv = t.extractfile("apk-index/src/apkindex/server.py").read().decode("utf-8", "replace")
+# 收集 "from . import X" 与 "from .X import Y"（含相对导入别名）
+mods = set()
+for m in re.finditer(r"from \. import (\w+)", srv):
+    mods.add(m.group(1))
+for m in re.finditer(r"from \.(\w+) import", srv):
+    mods.add(m.group(1))
+missing = sorted(m for m in mods if f"src/apkindex/{m}.py" not in names)
+if missing:
+    print("  缺包内模块（server.py import 了但不在包里）:", ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+print("  包内依赖自检通过（server.py 引用模块全部在包）")
+PYCHECK
