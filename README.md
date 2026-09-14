@@ -1,5 +1,6 @@
 # apk-index —— Android 逆向 / Xposed 模块开发用的 APK 索引 MCP Server
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/wlmosv-png/apk-index)](https://m8ven.ai/mcp/wlmosv-png/apk-index)
 静态索引 APK / split APK / AAR / 裸 dex / vdex / compact-dex，给 Agent 提供
 「查类、查成员、查签名、查字符串、查交叉引用、生成 hook 起手块」的只读能力。
 纯 Python 3 标准库（zipfile / sqlite3 / struct / json / hashlib），stdio 上说 MCP JSON-RPC 2.0。
