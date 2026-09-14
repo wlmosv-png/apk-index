@@ -378,7 +378,7 @@ def _r_stats(res: dict) -> str:
     lines = [_head("stats", res, "包 %s" % (res.get("label") or res.get("pkg")
                                            or fp.get("pkg") or "-"))]
     if res.get("counts"):
-        lines.append("  计数    " + _flat(res["counts"], 460))   # 300 会把注解数挤掉
+        lines.append("  计数    " + _flat(res["counts"], 300))
     if res.get("packed") is not None:
         s = "  加固    " + ("是" if res["packed"] else "否")
         if res.get("packerEvidence"):
@@ -525,6 +525,151 @@ def _r_generic(res: dict) -> str:
     return "\n".join(lines + _tail(res))
 
 
+
+
+def _component_line(idx: int, c: Any) -> list:
+    if not isinstance(c, dict):
+        return ["%3d  %s" % (idx, _flat(c, WIDE - 6))]
+    cname = c.get("name") or c.get("class") or c.get("binaryName") or "-"
+    out = ["%3d  [%s] %s" % (idx, c.get("type") or "?", cname)]
+    for key in ("exported", "permission", "process"):
+        if c.get(key) is not None:
+            out.append(IND + _pad(key, 11) + str(c[key]))
+    return [l.rstrip() for l in out]
+
+
+def _r_manifest(res: dict) -> str:
+    items = res.get("items") or []
+    man = res.get("manifest") or {}
+    lines = [_head("listManifest", res, "%d 个组件   包 %s"
+                   % (res.get("total") or 0, man.get("package") or _sess(res)))]
+    for key, lab in (("minSdk", "minSdk"), ("targetSdk", "targetSdk"),
+                     ("application", "application")):
+        if man.get(key) is not None:
+            lines.append("  " + _pad(lab, 13) + str(man.get(key)))
+    perms = man.get("usesPermissions") or []
+    if perms:
+        lines.append("  " + _pad("权限", 13) + ", ".join(str(x) for x in perms[:12])
+                     + (" ……" if len(perms) > 12 else ""))
+    comps = man.get("components") or {}
+    counts = "  ".join("%s %d" % (k, len(v or [])) for k, v in comps.items() if v)
+    if counts:
+        lines.append("  " + _pad("组件", 13) + counts)
+    if items:
+        lines += _numed(items, _component_line)
+    r = _rest(res.get("total") or 0, len(items))
+    if r:
+        lines.append(r)
+    return "\n".join(lines + _tail(res))
+
+
+def _r_find_comp(res: dict) -> str:
+    items = res.get("items") or []
+    lines = [_head("findComponent", res, "命中 %d" % (res.get("total") or 0))]
+    if not items:
+        lines.append("  没有匹配组件。去掉 exported / componentType 再试，"
+                     " 或确认该 APK 会话确实带 AndroidManifest.xml。")
+    else:
+        lines += _numed(items, _component_line)
+    r = _rest(res.get("total") or 0, len(items))
+    if r:
+        lines.append(r)
+    return "\n".join(lines + _tail(res))
+
+
+def _r_resources(res: dict) -> str:
+    items = res.get("items") or []
+    rt = res.get("resourceTable") or {}
+    lines = [_head("searchResources", res, "命中 %d   资源表 %s"
+                   % (res.get("total") or 0,
+                      "可用" if rt.get("available") else "不可用"))]
+    if rt.get("packages"):
+        lines.append("  " + _pad("包", 13) + _flat(rt.get("packages"), 160))
+    if rt.get("types"):
+        tn = ", ".join("%s(%s)" % (t.get("type"), t.get("entryCount"))
+                       for t in list(rt["types"])[:10])
+        lines.append("  " + _pad("类型", 13) + tn
+                     + (" ……" if len(rt["types"]) > 10 else ""))
+    if not items:
+        lines.append("  没有条目。resourceType/query 可能收窄过头；entriesSample 上限 512，"
+                     " 解析失败时看 resourceTable.notes。")
+    else:
+        lines += _numed(items, lambda i, it: [
+            "%3d  %s/%s  typeId=%s" % (i, it.get("type"), it.get("name"),
+                                        it.get("typeId"))])
+    r = _rest(res.get("total") or 0, len(items))
+    if r:
+        lines.append(r)
+    return "\n".join(lines + _tail(res))
+
+
+def _r_resrefs(res: dict) -> str:
+    items = res.get("items") or []
+    lines = [_head("resourceRefs", res, "命中 %d" % (res.get("total") or 0))]
+    if not items:
+        lines.append("  代码里没找到直接引用（字符串或 const-class）。"
+                     " 资源可能经 getIdentifier / XML 加载 / 反射访问。")
+    else:
+        def one(i, it):
+            label = (it.get("string") or it.get("candidate") or it.get("class") or "-")
+            out = ["%3d  [%s] %s" % (i, it.get("kind") or "?", label)]
+            sig = it.get("smali") or it.get("reflector") or it.get("java")
+            if sig:
+                out.append(IND + str(sig))
+            return [l.rstrip() for l in out]
+        lines += _numed(items, one)
+    r = _rest(res.get("total") or 0, len(items))
+    if r:
+        lines.append(r)
+    return "\n".join(lines + _tail(res))
+
+
+def _r_ressec(res: dict) -> str:
+    it = dict((res.get("items") or [{}])[0])
+    lines = [_head("resourceSecurity", res, "包 %s"
+                   % (it.get("manifestPackage") or _sess(res)))]
+    for key, lab in (("minSdk", "minSdk"), ("targetSdk", "targetSdk"),
+                     ("application", "application"), ("resourceTable", "资源表")):
+        if key in it:
+            lines.append("  " + _pad(lab, 13) + str(it[key]))
+    for key, lab in (("usesPermissions", "权限"), ("dangerousPermissions", "危险权限"),
+                     ("exportedComponents", "导出组件"), ("resourceTypes", "资源类型"),
+                     ("nativeLibs", "native 库")):
+        v = it.get(key)
+        if v:
+            if isinstance(v, list):
+                sample = []
+                for x in v[:10]:
+                    if isinstance(x, dict):
+                        sample.append(str(x.get("name") or x.get("abi") or x.get("type") or "-"))
+                    else:
+                        sample.append(str(x))
+                lines.append("  " + _pad(lab, 13) + ", ".join(sample)
+                             + (" …… 共 %d" % len(v) if len(v) > 10 else ""))
+            else:
+                lines.append("  " + _pad(lab, 13) + str(v))
+    for n in (it.get("notes") or [])[:3]:
+        lines.append("  " + _pad("notes", 13) + str(n)[:120])
+    return "\n".join(lines + _tail(res))
+
+
+def _r_doctor(res: dict) -> str:
+    lines = [_head("doctor", res, "缓存 %s   问题 %d"
+                   % (res.get("cacheHuman") or res.get("cacheDir"),
+                      len(res.get("issues") or [])))]
+    for s in (res.get("sessions") or [])[:40]:
+        issue = ("  " + str(s.get("issue"))) if s.get("issue") else ""
+        lines.append("  %s  %-10s %s  quick=%s schema=%s%s"
+                     % (_pad(s.get("sessionId"), 17), s.get("kind") or "-",
+                        (s.get("pkg") or "-")[:28], s.get("quickCheck") or "-",
+                        s.get("schemaVersion") or "-", issue))
+    for msg in (res.get("issues") or [])[:20]:
+        lines.append("  问题    " + str(msg)[:160])
+    for msg in (res.get("notes") or [])[:10]:
+        lines.append("  说明    " + str(msg)[:160])
+    return "\n".join(lines + _tail(res))
+
+
 RENDERERS: dict = {
     "searchClasses": _r_classes,
     "findImplementations": _r_findimpl,
@@ -540,6 +685,9 @@ RENDERERS: dict = {
     "diffSessions": _r_diff,
     "probe": _r_probe,
     "loadApk": _r_load, "loadAar": _r_load, "loadDex": _r_load, "unload": _r_load,
+    "listManifest": _r_manifest, "findComponent": _r_find_comp,
+    "searchResources": _r_resources, "resourceRefs": _r_resrefs,
+    "resourceSecurity": _r_ressec, "doctor": _r_doctor,
 }
 
 

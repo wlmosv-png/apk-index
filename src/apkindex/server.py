@@ -24,10 +24,12 @@ import traceback
 from typing import Any, Callable
 
 from . import backends
+from . import ctx as owner_ctx
 from . import decomp
 from . import envelope as env
 from . import loaders
 from . import queries
+from . import resource as resource_mod
 from .config import (DEFAULT_LIMIT, ErrorCode, MAX_RESPONSE_BYTES, NAME,
                      PROTOCOL_VERSIONS, VERSION, settings)
 from .render import render
@@ -196,6 +198,47 @@ TOOLS: list[dict] = [
            "minScore": _p("number", "结构相似度阈值，默认 0.55"),
            "scope": _S_SCOPE, "limit": _S_LIMIT},
           ["sessionA", "sessionB"], queries.diff_sessions),
+    _tool("listManifest",
+          "读取会话索引时保存的 AndroidManifest 摘要：包名、版本、SDK、权限、四大组件、native 库。"
+          "可按 componentType/query/exported 过滤组件。",
+          {"sessionId": _S_ID,
+           "componentType": _p("string","activity / service / receiver / provider / component；默认全部"),
+           "query": _p("string","按组件名模糊过滤"),
+           "exported": _p("boolean","只保留清单里显式 exported=true 的组件"),
+           "limit": _S_LIMIT},
+          ["sessionId"], resource_mod.list_manifest),
+    _tool("findComponent",
+          "在四大组件里按名称/类型/exported 查一个组件。比 listManifest 更窄，适合'我只要 MainActivity'。",
+          {"sessionId": _S_ID,
+           "name": _p("string","组件名（可只写短名，做后缀匹配）"),
+           "componentType": _p("string","activity / service / receiver / provider"),
+           "exported": _p("boolean","只保留显式 exported=true 的组件"),
+           "limit": _S_LIMIT},
+          ["sessionId"], resource_mod.find_component),
+    _tool("searchResources",
+          "枚举 resources.arsc 的条目（type/name/typeId）。best-effort 解析；解析失败会明确报 NOT_FOUND 而不是给假空结果。",
+          {"sessionId": _S_ID,
+           "query": _p("string","条目名过滤"),
+           "match": _p("string","contains / prefix / regex", default="contains"),
+           "resourceType": _p("string","只看某一种资源类型，如 string / layout"),
+           "limit": _S_LIMIT},
+          ["sessionId"], resource_mod.search_resources),
+    _tool("resourceRefs",
+          "找 DEX 里引用某个资源的代码：字符串常量（资源名 / R.type.name）+ const-class（R$type / BuildConfig）。返回真实方法 xref，不是猜测。",
+          {"sessionId": _S_ID,
+           "resource": _p("string","资源引用，如 string/app_name 或 layout/main"),
+           "resourceType": _p("string","只看某资源类型（string / layout / drawable）"),
+           "limit": _S_LIMIT},
+          ["sessionId"], resource_mod.resource_refs),
+    _tool("resourceSecurity",
+          "安全面汇总：exported 组件、危险权限、native 库、资源表可用性。用于快速判断 APK 的外露面。",
+          {"sessionId": _S_ID, "limit": _S_LIMIT},
+          ["sessionId"], resource_mod.resource_security),
+    _tool("doctor",
+          "只读缓存体检：每个会话的 db 是否存在、quick_check、schemaVersion、缓存总大小、未登记 db 文件。"
+          "发现问题后用 unload + loadApk 重建，不要手改缓存。",
+          {"limit": _S_LIMIT},
+          [], resource_mod.doctor),
     _tool("probe",
           "一次常用侦察：自动从问题里抽引号字面量/中文文案/类名关键词，串起 checkPacker+stats+"
           "searchByString+searchClasses+hook 候选+建议 DSL，返回结构化证据包（省往返、省 token）。",
@@ -288,7 +331,7 @@ def call_tool(name: str, args: dict | None = None) -> dict:
         _check_arg_names(name, tool, args)
     except backends.ApkIndexError as exc:
         # 参数名写错属于调用方错误：必须回 ok:false，抛穿边界客户端只看到
-        # JSON-RPC fault，拿不到"哪个参数、可选哪些"。手机上的 MCP 客户端会直接判服务挂了。
+        # JSON-RPC fault，拿不到"哪个参数、可选哪些"。LSPilot 这类客户端会直接判服务挂了。
         _log("bad argument", name, repr(exc))
         return env.from_error(exc)
     try:
@@ -480,6 +523,7 @@ class Server:
 def serve(stdin=None, stdout=None) -> int:
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
+    owner_ctx.set_owner(owner_ctx.process_owner())
     srv = Server()
     for raw in stdin:
         line = raw.strip()
@@ -510,6 +554,7 @@ def _one_shot(name: str, args: dict) -> int:
 
 def selftest() -> int:
     """In-process protocol check: handshake, tool table, three real calls."""
+    owner_ctx.set_owner("selftest")
     srv = Server()
     problems: list[str] = []
     init = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",

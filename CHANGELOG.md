@@ -1,8 +1,52 @@
 # 变更
 
+## 0.5.1 — 多客户端隔离：owner 租户 + 跨进程写锁
+
+修复两个客户端（两个对话 / 两个工作）同时连同一个实例时会话互相可见、
+互相卸载、写库互相踩的问题。sessionList 按客户端隔离，索引文件按引用计数
+共享（同一包只建一次索引），unload 只解除自己的引用、最后一人释放才删文件。
+
+- **owner 租户**：每个客户端一个身份。HTTP 用 MCP-Session-Id 请求头（客户端
+  initialize 后回传）；stdio 每进程随机（APK_INDEX_OWNER 环境变量可固定）；
+  CLI 单次调用默认 `cli`。不带 session id 的老客户端归 `default`，向后兼容。
+- **sessionList 只显示本客户端的会话**：A load 的包 B 看不到，B 也卸载不了 A 的。
+- **索引文件全局共享 + 引用计数**：同包多客户端 load 复用同一份索引（性能不损），
+  `unload` 只解除当前 owner 的引用；最后一个引用者释放时才真正删文件。
+- **跨进程写锁**：`IndexWriter` 持有 `<db>.lock`（flock），两个进程同时索引同一
+  新包不再互相踩坏；catalog 写操作也有文件锁保护。
+- 自测 40/40（新增 owner 隔离 + HTTP session 头隔离两个用例）。
+
+## 0.5.0 — 完整化：manifest / 资源 / 安全面 / 缓存体检（6 个新工具）
+
+从"DEX 索引"升级成"APK 分析面"。新模块 `src/apkindex/resource.py`，schema 不变（6），
+纯 stdlib，全程只读。
+
+- **加 `listManifest`**：读取 loadApk 时已存的 manifest 摘要（包/版本/minSdk/targetSdk/
+  application/usesPermissions/permission/features/四大组件/native 库），支持
+  componentType / query / exported 过滤。不重新解包，毫秒级。
+- **加 `findComponent`**：按短名后缀 / 类型 / exported 精确定位组件。
+- **加 `searchResources` + `read_arsc`**：best-effort 解析 resources.arsc（ResString_pool
+  UTF-8/UTF-16、package/type chunk、entry 名采样 ≤512）。解析失败返回
+  `NOT_FOUND` + notes，明确"不知道"而不是假空。
+- **加 `resourceRefs`**：资源名 → 代码。两路证据：DEX 字符串常量（含 `R.type.name` 拼法）
+  与 const-class（`R$type` / `BuildConfig`）；返回的是真实 xref 边的方法，带
+  smali/reflector/java。0 命中 hint 解释 getIdentifier/XML/插件化三类盲区。
+- **加 `resourceSecurity`**：单条聚合安全面（exported 组件、危险权限、native 库、资源表），
+  便于跨版本 diff。exported 过滤是**严格**语义：None（未声明）既不归 true 也不归 false。
+- **加 `doctor`**：只读缓存体检——逐会话 quick_check / schemaVersion / 体积、缓存总大小、
+  未登记 `.db`。只报不修；处置路径 unload+loadApk 写在 hint。
+- **修 `loadAar(mergeInto=...)` 顶掉宿主 manifest**：并入库后 listManifest /
+  resourceSecurity 看到的是 AAR 自己的清单（无组件、包名变库包名）。现在宿主
+  manifest/components 优先，nativeLibs 取并集。旧的混合会话要 force 重建。
+- **测试辅助 `tool()` 首参改名 `_tool_name_`**：findComponent 本身有 `name` 参数，
+  `tool("findComponent", name=...)` 直接 `got multiple values`。位置调用全部兼容。
+- render 层为 6 个新工具配了人读版式（组件表/资源表/安全面/体检），失败路径同样渲染。
+- 自测 38 组全绿（原 32 + 新 6）。版本号 config/pyproject 统一到 0.5.0
+  （pyproject 此前停在 0.4.1）。
+
 ## 0.4.4 — 注解进得来、查得到（schema 6）
 
-真机样本回归（17.9MB / 3 dex / 26695 类）暴露：注解表里全是错位垃圾。
+真样本回归（LSPilot 1.1.1，17.9MB / 3 dex / 26695 类）暴露：注解表里全是错位垃圾。
 
 - **dex 注解按现行布局解析**：`annotation_item = ubyte visibility + encoded_annotation`
   （visibility 写在 `encoded_annotation` 内部是早年 spec 的写法，d8 不这么发）。旧读法把
@@ -23,7 +67,7 @@
 - **`getSignature` 文本视图修复**：不带 `member` 时以前只印“0 个匹配”，四种写法与注解全在
   `signature` 里没出来；现在印类级块（class/reflector/classForName/smali/parent/注解）。
 - **缓存位置钉死**：`APK_INDEX_CACHE` 以前随 cwd 漂移（仓库 `.cache` 与 `/root/.cache` 都
-  出现过，索引散两处、空间统计失真）。启动器钉到 `$APK_INDEX_CACHE`。
+  出现过，索引散两处、空间统计失真）。启动器钉到 `/data/local/tmp/apk-index/.cache`。
 - **`force=true` 真的重建**：以前同 sha + schema 匹配时 force 直接命中旧索引返回，改了索引
   代码却拿旧数据，看起来像“修了没用”。
 - **`dexwrite` 写注解同步为现行布局**（visibility 提前、集合偏移 uint），fixture 与读端
@@ -31,7 +75,7 @@
 - 自测坑：换 fixture 后要清 `.testtmp` 再跑，否则 catalog 指向失效会话库，一轮里会冒出
   十几个假失败；清空后连续两轮 32/32。
 - 顺带更正一条旧结论：`checkPacker` 并没有“dex 数 ≥2 就算加固”的规则，真样本被判加固是
-  旧索引里那坨错位注解导致的。重建后：真实 App=否(none)、合成壳样本=是(high)。
+  旧索引里那坨错位注解导致的。重建后 LSPilot=否(none)、360 壳样本=是(high)。
 ## 0.4.3
 - **加**：`tools/list` 每个工具都带 `annotations` 与 `outputSchema`。四个注解按名字
   锁死并进回归测试：只有 `unload` 是 `destructiveHint`（删的是自己的索引缓存），
@@ -54,7 +98,7 @@
   方法表里不存在的位置 —— 代码能编译、运行期静默不命中。现在判据是 `name == "<init>"`，
   修饰符词表按名字校正（`<clinit>` → `static-initializer`），DSL 对 `<clinit>` 直接给出
   说明与两条可行路子而不是假 matcher。`SCHEMA_VERSION` 3→4：旧库存的值是错的，
-  加载时按 INDEX_STALE 拒用，`loadApk(force=true)` 重建。真机样本暴露。
+  加载时按 INDEX_STALE 拒用，`loadApk(force=true)` 重建。真机样本 LSPilot 1.1.1 暴露。
 - **加**：`tools/http_check.py`：HTTP 传输的自检客户端（health / list 校注解 /
   call 单条 / demo 真机样本全链路带计时）。
 - **文**：新增 `docs/HTTP-DEPLOY.md`（路由与帧的选择、状态码映射表、上限表、
@@ -73,7 +117,7 @@
   成功就 overall 200；body 超限先读干净再回 413，否则客户端只看到 broken pipe。
 - **加**：意外异常兜底回 500 带原因，不再静默断连。
 - **加**：`tools/httpd-android.sh` 启动器（幂等：绑定三条宿主路径进 chroot、
-  按 cmdline 杀旧、`setsid` 起新、探活）+ `<SERVICE.D>/` 开机自启。
+  按 cmdline 杀旧、`setsid` 起新、探活）+ `/data/adb/service.d/` 开机自启。
 - **修**：`verbose` 下打印请求头摘要与慢请求耗时，网关类问题能一眼对上。
 
 ## 0.4.1

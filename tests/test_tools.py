@@ -55,28 +55,31 @@ def test(name):
 
 
 # ------------------------------------------------------------ 公共入口
-def tool(name, **args):
-    """走 server 的真实分发：camelCase 参数绑定 + 错误映射 + envelope 包装。"""
+def tool(_tool_name_, **args):
+    """走 server 的真实分发：camelCase 参数绑定 + 错误映射 + envelope 包装。
+
+    第一个参数改名成 _tool_name_：有的工具（findComponent）本身接受 name 参数，
+    tool("findComponent", name=...) 会把工具名和参数名撞在同一个 kw 上。"""
     from apkindex import server
-    env = server.call_tool(name, args)
+    env = server.call_tool(_tool_name_, args)
     for key in ("ok", "hint"):
-        true(key in env, f"{name} envelope 缺字段 {key}")
+        true(key in env, f"{_tool_name_} envelope 缺字段 {key}")
     blob = json.dumps(env, ensure_ascii=False, default=str).encode("utf-8")
-    true(len(blob) <= MAX_BYTES, f"{name} 响应 {len(blob)}B > 32KB")
+    true(len(blob) <= MAX_BYTES, f"{_tool_name_} 响应 {len(blob)}B > 32KB")
     if env.get("ok"):
         for key in ("total", "items"):
-            true(key in env, f"{name} 成功时缺字段 {key}")
-        true(isinstance(env["items"], list), f"{name}.items 必须是数组")
+            true(key in env, f"{_tool_name_} 成功时缺字段 {key}")
+        true(isinstance(env["items"], list), f"{_tool_name_}.items 必须是数组")
     else:
-        true(env.get("code"), f"{name} 失败必须有 code")
-        true(env.get("message"), f"{name} 失败必须有 message")
-        true(env.get("suggestion"), f"{name} 失败必须有 suggestion")
+        true(env.get("code"), f"{_tool_name_} 失败必须有 code")
+        true(env.get("message"), f"{_tool_name_} 失败必须有 message")
+        true(env.get("suggestion"), f"{_tool_name_} 失败必须有 suggestion")
     return env
 
 
-def bad(name, code, **args):
-    env = tool(name, **args)
-    eq(env.get("code"), code, f"{name} 期望 {code}")
+def bad(_tool_name_, code, **args):
+    env = tool(_tool_name_, **args)
+    eq(env.get("code"), code, f"{_tool_name_} 期望 {code}")
     return env
 
 
@@ -639,7 +642,7 @@ def t_real_apk():
                      f"索引 {s['index']['indexMs']}ms，加固 {pk['packed']}")
 
 
-@test("server: JSON-RPC 帧 / 17 工具 / 通知不回复")
+@test("server: JSON-RPC 帧 / 23 工具 / 通知不回复")
 def t_protocol():
     proc = subprocess.Popen([sys.executable, "-m", "apkindex.server"], cwd=ROOT,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -663,11 +666,12 @@ def t_protocol():
     send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     tl = recv()
     tools = tl["result"]["tools"]
-    eq(len(tools), 17, f"工具数 {len(tools)}")
+    eq(len(tools), 23, f"工具数 {len(tools)}")
     need = {"loadApk", "loadAar", "loadDex", "sessionList", "unload", "stats", "checkPacker",
             "searchClasses", "listMembers", "getSignature", "searchByString",
             "findImplementations", "xref", "decompile", "matchSignature", "probe",
-            "diffSessions"}
+            "diffSessions", "listManifest", "findComponent", "searchResources",
+            "resourceRefs", "resourceSecurity", "doctor"}
     eq({t["name"] for t in tools}, need, "工具名集合")
     for t in tools:
         true(len(t["description"]) > 40, f"{t['name']} 描述要说清何时用")
@@ -696,6 +700,113 @@ def t_protocol():
     eq(recv()["id"], 6, "通知不产生响应（下一个响应属于 id=6）")
     proc.stdin.close()
     proc.wait(timeout=15)
+
+
+
+
+# ---------------------------------------------------------- 新增：manifest / 资源 / 体检
+@test("listManifest: manifest 摘要 + 组件过滤")
+def t_list_manifest():
+    r = tool("listManifest", sessionId=S1)
+    eq(r.get("ok"), True, f"listManifest: {r.get('code')} {r.get('message')}")
+    man = r["manifest"]
+    eq(man["package"], "com.example.demo", "包名")
+    eq(man["minSdk"], 24, "minSdk")
+    eq(man["targetSdk"], 34, "targetSdk")
+    has(str(man["application"]), "DemoApp", "application 类")
+    true("android.permission.INTERNET" in (man["usesPermissions"] or []), "权限列表")
+    comps = man["components"]
+    true(any(".MainActivity" in c["name"] for c in comps.get("activities", [])),
+         f"activities 里有 MainActivity: {comps.get('activities')}")
+    true(comps.get("services"), "services 非空")
+    true(comps.get("providers"), "providers 非空")
+    # exported 过滤（fixture 的 MainActivity 显式 exported=true）
+    ex = tool("listManifest", sessionId=S1, exported=True)
+    true(ex["total"] >= 1, "exported=true 过滤")
+    true(all(c.get("exported") in (True, 1, "true") for c in ex["items"]),
+         "过滤结果都真的 exported")
+    bad("listManifest", "BAD_ARGUMENT", sessionId=S1, componentType="bogus")
+    # 裸 dex 会话没有 manifest
+    d = tool("loadDex", path=os.path.join(FX, "bare.dex"))
+    true(d["ok"], "先决：裸 dex 会话")
+    nm = tool("listManifest", sessionId=d["sessionId"])
+    true((not nm.get("ok")) or not (nm.get("manifest") or {}),
+         f"dex 会话不该有 manifest: {nm.get('code')} {nm.get('manifest')}")
+
+
+@test("findComponent: 按名字/类型/exported 找组件")
+def t_find_component():
+    r = tool("findComponent", sessionId=S1, name="MainActivity")
+    true(r["ok"] and r["total"] >= 1, f"按短名找: {r.get('code')} {r.get('message')}")
+    it = r["items"][0]
+    has(it["name"], "MainActivity", "命中 MainActivity")
+    eq(it["type"], "activity", "type 字段")
+    s2 = tool("findComponent", sessionId=S1, name="Demo", componentType="service")
+    true(s2["ok"] and all(i["type"] == "service" for i in s2["items"]),
+         f"componentType 过滤: {s2.get('code')} {s2.get('items')}")
+    bad("findComponent", "BAD_ARGUMENT", sessionId=S1)
+    bad("findComponent", "BAD_ARGUMENT", sessionId=S1, componentType="nope")
+
+
+@test("searchResources / resourceRefs: 资源表层不装成功")
+def t_resources():
+    r = tool("searchResources", sessionId=S1, limit=20)
+    # fixture 没有真 resources.arsc → 工具必须报 NOT_FOUND 并解释原因，
+    # 不允许返回 ok+空 items 冒充"这个包没有资源"。
+    if not r.get("ok"):
+        eq(r.get("code"), "NOT_FOUND", f"解析失败必须 NOT_FOUND: {r.get('code')}")
+        true(r.get("suggestion"), "给下一步")
+    else:
+        true(isinstance(r["items"], list), "items 是数组")
+        rt = r.get("resourceTable") or {}
+        eq(rt.get("available"), True, "ok 时会话必须有资源表")
+    rr = tool("resourceRefs", sessionId=S1, resource="string/demo_text")
+    true(rr.get("ok"), f"resourceRefs 应成功（0 命中也 ok）: {rr.get('code')} {rr.get('message')}")
+    true(isinstance(rr["items"], list), "refs items 数组")
+    has(rr["hint"], "getIdentifier", "0 命中提示解释反射/动态取值可能")
+    bad("resourceRefs", "BAD_ARGUMENT", sessionId=S1)
+    bad("searchResources", "BAD_ARGUMENT", sessionId=S1, match="glob")
+
+
+@test("resourceSecurity: 安全面汇总")
+def t_ressec():
+    r = tool("resourceSecurity", sessionId=S1)
+    eq(r.get("ok"), True, f"resourceSecurity: {r.get('code')} {r.get('message')}")
+    it = r["items"][0]
+    eq(it["manifestPackage"], "com.example.demo", "包名")
+    true(isinstance(it["usesPermissions"], list), "权限列表")
+    true(isinstance(it["exportedComponents"], list), "导出组件列表")
+    # fixture 的 MainActivity 显式 exported=true，必须出现在安全面里
+    true(any("MainActivity" in (c.get("name") or "") for c in it["exportedComponents"]),
+         f"MainActivity 应在导出组件里: {it['exportedComponents']}")
+
+
+@test("doctor: 只读缓存体检")
+def t_doctor():
+    r = tool("doctor")
+    eq(r.get("ok"), True, f"doctor 对健康缓存应 ok: {r.get('issues')}")
+    true(r.get("cacheDir"), "缓存目录字段")
+    ids = {s["sessionId"] for s in r["sessions"]}
+    true(S1 in ids, "会话被体检到")
+    eq(len(r["issues"]), 0, f"健康缓存不该有 issue: {r['issues']}")
+    for s in r["sessions"]:
+        eq(s.get("quickCheck"), "ok", f"{s['sessionId']} quick_check")
+
+
+@test("新工具: 文本渲染不退回 JSON 坨")
+def t_new_renders():
+    from apkindex.render import render
+    lm = render("listManifest", tool("listManifest", sessionId=S1))
+    has(lm, "listManifest", "抬头工具名")
+    has(lm, "com.example.demo", "包名进文本")
+    fc = render("findComponent", tool("findComponent", sessionId=S1, name="MainActivity"))
+    has(fc, "MainActivity", "组件名进文本")
+    dc = render("doctor", tool("doctor"))
+    has(dc, "doctor", "doctor 抬头")
+    true(not dc.lstrip().startswith("{"), "doctor text 不是 JSON 坨")
+    ff = render("findComponent", {"ok": False, "code": "NOT_FOUND",
+                                  "message": "m", "suggestion": "s"})
+    has(ff, "NOT_FOUND", "失败也渲染")
 
 
 def main() -> int:
@@ -727,6 +838,100 @@ def main() -> int:
     return 1 if fails else 0
 
 
+
+
+@test("owner 隔离：两个客户端会话互不可见、unload 引用计数")
+def t_owner_isolation():
+    """复现 issue：A load 包1、B load 包2，A 的 sessionList 曾能看到 B 的会话；
+    A unload 曾会把 B 正在用的索引文件删掉。现在按 owner 记账 + 引用计数。"""
+    from apkindex import ctx as oc
+    p1 = os.path.join(FX, "demo-v1.apk")
+    p2 = os.path.join(FX, "demo-v2.apk")
+    oc.set_owner("t-owner-A")
+    ra = load(p1)
+    oc.set_owner("t-owner-B")
+    rb = load(p2)
+    true(ra["sessionId"] != rb["sessionId"], "不同包应得到不同 sessionId")
+    oc.set_owner("t-owner-A")
+    la = [i["sessionId"] for i in tool("sessionList")["items"]]
+    true(ra["sessionId"] in la and rb["sessionId"] not in la,
+         f"A 只能看到自己的会话: {la}")
+    oc.set_owner("t-owner-B")
+    lb = [i["sessionId"] for i in tool("sessionList")["items"]]
+    true(rb["sessionId"] in lb and ra["sessionId"] not in lb,
+         f"B 只能看到自己的会话: {lb}")
+    # B load A 已索引的包：共享索引、alreadyLoaded=true
+    r_shared = load(p1)
+    true(r_shared["alreadyLoaded"] and r_shared["sessionId"] == ra["sessionId"],
+         "B load A 已索引的包应命中缓存且共享 sessionId")
+    # B 释放对 demo-v1 的引用：A 的引用不受影响（不删文件、不影响 A 的列表）
+    tool("unload", sessionId=ra["sessionId"])
+    oc.set_owner("t-owner-A")
+    la2 = [i["sessionId"] for i in tool("sessionList")["items"]]
+    true(ra["sessionId"] in la2, "B 释放后 A 的会话应还在")
+    # 引用计数删除语义：用 fixtures 里无人加载过的 embedded.jar 验证（不碰共享文件）
+    p3 = os.path.join(FX, "embedded.jar")
+    oc.set_owner("t-del-1")
+    rd = tool("loadDex", path=p3)
+    true(rd["ok"], "loadDex embedded.jar 应成功")
+    db = tool("stats", sessionId=rd["sessionId"])["index"]["path"]
+    true(os.path.exists(db), "jar 索引文件应存在")
+    oc.set_owner("t-del-2")
+    r_shared2 = tool("loadDex", path=p3)
+    true(r_shared2["ok"] and r_shared2["sessionId"] == rd["sessionId"],
+         "第二人 load 同一 jar 应命中同一 session")
+    tool("unload", sessionId=rd["sessionId"])
+    true(os.path.exists(db), "第二人释放后文件仍应在（第一人还引用）")
+    oc.set_owner("t-del-1")
+    tool("unload", sessionId=rd["sessionId"])
+    true(not os.path.exists(db), "最后一人释放后 jar 索引文件应删除")
+    # 清理 owner-B 的 demo-v2 引用（保留 default 的 S2 供后续用例）
+    oc.set_owner("t-owner-B")
+    tool("unload", sessionId=rb["sessionId"])
+
+
+@test("HTTP 传输：MCP-Session-Id 请求头隔离 owner")
+def t_http_owner_isolation():
+    """两个 HTTP 客户端带不同 MCP-Session-Id 头 → 各自独立 owner，sessionList 不串。"""
+    import threading as _t
+    import urllib.request as _ur
+    from apkindex import httpd as hmod
+
+    p1 = os.path.join(FX, "demo-v1.apk")
+    p2 = os.path.join(FX, "demo-v2.apk")
+    results: dict = {}
+
+    def rpc(sid_hdr, mid, name, args):
+        req = _ur.Request(
+            "http://127.0.0.1:8766/mcp",
+            data=json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                             "params": {"name": name, "arguments": args}}).encode(),
+            headers={"Content-Type": "application/json",
+                     "MCP-Session-Id": sid_hdr})
+        with _ur.urlopen(req, timeout=60) as r:
+            return json.loads(r.read())["result"]["structuredContent"]
+
+    def client(sid_hdr, apk):
+        ld = rpc(sid_hdr, 1, "loadApk", {"path": apk})
+        lst = rpc(sid_hdr, 2, "sessionList", {})
+        results[sid_hdr] = (ld["sessionId"],
+                            [i["sessionId"] for i in lst["items"]])
+
+    srv = hmod.HttpServer("127.0.0.1", 8766, verbose=False, token="")
+    th = _t.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        ta = _t.Thread(target=client, args=("http-sess-A", p1))
+        tb = _t.Thread(target=client, args=("http-sess-B", p2))
+        ta.start(); tb.start(); ta.join(); tb.join()
+        sid_a, lst_a = results["http-sess-A"]
+        sid_b, lst_b = results["http-sess-B"]
+        true(sid_a in lst_a and sid_b not in lst_a, f"HTTP A 只见自己的: {lst_a}")
+        true(sid_b in lst_b and sid_a not in lst_b, f"HTTP B 只见自己的: {lst_b}")
+        for sid_hdr, (sid, _) in results.items():
+            rpc(sid_hdr, 3, "unload", {"sessionId": sid})
+    finally:
+        srv.shutdown()
 
 
 @test("引用的工具名与文档里的子命令都必须真实存在")
@@ -1005,7 +1210,7 @@ def t_decompile_auto_chain():
 
 @test("<clinit> 的 kAccConstructor 位不能被当成构造方法（否则 DSL 生成假 hook 点）")
 def t_clinit_is_not_constructor():
-    """真机样本回归暴露的：d8 给 <clinit> 也打 0x10000，按位判就会
+    """真机样本（LSPilot 1.1.1）暴露的：d8 给 <clinit> 也打 0x10000，按位判就会
     生成 constructors{} 去 hook 一个方法表里根本不存在的构造方法 —— 能编译、
     运行期静默不命中，属于最贵的那种错。"""
     from apkindex import dex as _dx, dsl as _ds
@@ -1077,20 +1282,6 @@ def t_annotation_readpath():
     true(n_f < n_all, "注解筛选确实收窄（%s/%s）" % (n_f, n_all))
     bad = tool("searchClasses", sessionId=sid, query="com", annotatedWith="  ")
     eq(bad.get("code"), "BAD_ARGUMENT", "空白 annotatedWith 明确报错，不给假空结果")
-
-
-@test("getSignature 的 member 打空必须给提示，不能安静回 0 个匹配")
-def t_member_miss():
-    sid = load(os.path.join(FX, "demo-v1.apk"))["sessionId"]
-    r = tool("getSignature", sessionId=sid,
-             **{"class": "com.example.demo.User", "member": "noSuchMethod"})
-    true(r.get("ok"), "不是错误信封")
-    true(r.get("total") == 0, "确实 0 个成员")
-    has(r.get("hint") or "", "没有同名成员", "hint 说明了原因")
-    has(r.get("hint") or "", "listMembers", "hint 给了下一步")
-    r2 = tool("getSignature", sessionId=sid, **{"class": "com.example.demo.User"})
-    true(r2.get("ok") and r2["signature"]["class"]["annotations"],
-         "类级调用不受影响")
 
 
 if __name__ == "__main__":

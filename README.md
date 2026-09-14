@@ -1,298 +1,269 @@
-# apk-index
+# apk-index —— Android 逆向 / Xposed 模块开发用的 APK 索引 MCP Server
 
+静态索引 APK / split APK / AAR / 裸 dex / vdex / compact-dex，给 Agent 提供
+「查类、查成员、查签名、查字符串、查交叉引用、生成 hook 起手块」的只读能力。
+纯 Python 3 标准库（zipfile / sqlite3 / struct / json / hashlib），stdio 上说 MCP JSON-RPC 2.0。
 
+## 运行要求
+- Python >= 3.10，无第三方依赖
+- 可选：JDK 的 `javac`（AAR fixture）与 `javap`（.class 交叉校验）；缺省时用内置 `tools/classwrite.py` 兜底
+- 只读挂载：索引写 `APK_INDEX_CACHE`（默认 `~/.cache/apk-index`），永不写源文件
 
-[![M8ven Live Monitored](https://m8ven.ai/badge/mcp/wlmosv-png-apk-index-1janc3)](https://m8ven.ai/mcp/wlmosv-png-apk-index-1janc3)
+## 多客户端隔离（0.5.1+）
 
+同时开两个对话 / 两个工作连同一个实例时，会话按 **owner（租户）** 隔离：
 
-本地跑的 **APK / AAR / DEX 结构索引 + MCP Server**。17 个工具，纯 Python 标准库，零运行时依赖。
+- HTTP：客户端 `initialize` 后回传 `MCP-Session-Id` 请求头 → 每个客户端一个
+  owner；不带头的老客户端归 `default`（兼容）。
+- stdio：每个进程随机 owner（可用环境变量 `APK_INDEX_OWNER` 固定）。
+- CLI：`APK_INDEX_OWNER` 或 `cli`。
 
-给它一个安装包，它把类、方法、字段、字符串常量、注解、继承关系、调用引用全部落进一个可查询的
-SQLite 会话；之后你问的都是真答案，而不是"印象里这个库里应该有"。
+隔离语义：`sessionList` 只显示本客户端的会话；`unload` 只解除自己的引用，
+**索引文件全局共享**（同一包只建一次索引，多客户端 load 命中缓存），
+最后一个引用者释放时才删文件。跨进程写索引有文件锁（`<db>.lock`），
+两个客户端同时索引同一新包不会互相踩。
 
-面向的活：给 Android 应用写 LSPosed/Xposed 模块、逆向排查、版本对比、判断有没有被加固。
-
-```text
-写 hook 之前你必然问过自己：这个包里到底有没有 X？
-apk-index 把这个问题变成一次查询，并且给得出证据。
-```
-
----
-
-## 为什么需要它
-
-写 hook 代码最容易犯的错，是把"我以为"当成"包里是这样"。类名猜错、重载签名写错、
-`<clinit>` 当构造方法挂上去（编译得过、运行期静默不命中）、目标是加固的所以静态结构全是壳代码
-—— 这些错误的共同点是：**成本后置**。你写完、装上、什么都不发生，才发现少查了一步。
-
-apk-index 的作用是把这一步前置成一次可验证的查询。所有回答都带 `total`（全量命中数）和
-`hint`（截断、降级、参数写错的提示），空结果必须能解释自己为什么是空的。
-
-## 特性
-
-- **零依赖**：只需要 `python3 >= 3.11`。不需要 pip 装任何包，不需要 root、不需要联网。
-  装了 `jadx` / `baksmali` 会自动升级反编译质量，没装就逐级降级，**绝不空手返回**。
-- **真索引，不是字符串搜索**：逐 dex 解析，方法体里的字符串常量、字段引用、方法引用一起入库，
-  所以能问"这句文案在哪个方法里""谁调用了这个方法"。
-- **注解可读**：类和方法上的注解带 descriptor、可见性（build/runtime/system）和元素值。
-  找未混淆锚点用 `@Keep`，判断是不是 Kotlin 用 `@Metadata`。
-- **加固判定**：stub 入口类、壳特征库、类数量与字符串熵，给证据链和结论。判成加固时
-  会直接告诉你静态 hook 无意义，先解壳。
-- **版本可对比**：两个会话之间做漂移匹配，回答"这版改了啥、那些改名是混淆还是真重构"。
-- **缓存复用**：同一 sha256 二次装载直接命中，不重建（一万多类的包省掉几十秒）。
-- **响应有硬预算**：单条 2KB、整包 32KB，超长值摘要化。给 LLM 当工具用不会被撑爆。
-- **两种传输**：stdio（客户端能自己拉进程）与 Streamable HTTP（客户端只能填一个 URL）。
-  协议行为、工具集、返回信封完全一致。
-
-## 安装
-
-```sh
-git clone https://github.com/wlmosv-png/apk-index.git
-cd apk-index
-python3 -m apkindex version          # 仓库内直接跑，不用装
-```
-
-装成命令（可选）：
-
-```sh
-pip install -e .            # 得到 apk-index
-apk-index version
-apk-index env               # 看 allowedRoots / 缓存位置 / 可用的反编译引擎与后端
-```
-
-不装任何东西也能用全部功能：`sh tools/apkidx.sh <子命令>`。
-
-## 五分钟上手
-
-```sh
-cd apk-index
-# 1. 索引一个包（base + split 自动合并），拿 sessionId
-python3 -m apkindex call loadApk '{"path":"/path/to/target.apk"}'
-
-# 2. 看规模和加固判定
-python3 -m apkindex call stats       '{"sessionId":"target"}'
-python3 -m apkindex call checkPacker '{"sessionId":"target"}'
-
-# 3. 定位目标：按名字、按注解、按文案
-python3 -m apkindex call searchClasses   '{"sessionId":"target","query":"Login","packageFilter":"com.example"}'
-python3 -m apkindex call searchClasses   '{"sessionId":"target","query":"com.example","annotatedWith":"@Keep"}'
-python3 -m apkindex call searchByString  '{"sessionId":"target","text":"登录中","minLen":2}'
-
-# 4. 要 hook 起手块：四种写法 + 注解，直接抄
-python3 -m apkindex call getSignature  '{"sessionId":"target","class":"com.example.LoginActivity","member":"doLogin"}'
-
-# 5. 看实现体和调用链
-python3 -m apkindex call decompile '{"sessionId":"target","target":"com.example.LoginActivity#doLogin()V","maxLines":200}'
-python3 -m apkindex call xref      '{"sessionId":"target","method":"com.example.LoginActivity#doLogin()V","direction":"callers","depth":2}'
-```
-
-`sessionId` 接受完整 id、**唯一前缀或包名**，不用复制粘贴 `ses_...`。
-
-一步都懒得组织的时候，用编排工具：
-
-```sh
-python3 -m apkindex call probe '{"sessionId":"target","question":"想拦截登录按钮的回调"}'
-```
-
----
-
-## 当 MCP Server 用
-
-### stdio（客户端能自己拉起进程）
-
+## 注册到 MCP 客户端
 ```json
 {
   "mcpServers": {
     "apk-index": {
       "command": "python3",
-      "args": ["-m", "apkindex"],
-      "cwd": "/path/to/apk-index",
-      "env": { "PYTHONPATH": "/path/to/apk-index/src" }
+      "args": ["-m", "apkindex.mcp", "--stdio"],
+      "env": {
+        "PYTHONPATH": "/data/local/tmp/apk-index/src",
+        "APK_INDEX_CACHE": "~/.cache/apk-index",
+        "APK_INDEX_ALLOWED_ROOTS": "/sdcard:/data/local/tmp"
+      }
     }
   }
 }
 ```
+`APK_INDEX_ALLOWED_ROOTS`（冒号分隔）是路径白名单，越界一律 `INVALID_PATH` —— 防止越权读宿主隐私文件。
 
-装成包之后把 `command`/`args` 换成 `["apk-index"]` 即可。
+## 23 个工具
+| 分类 | 工具 | 一句话 |
+|---|---|---|
+| 装载 | `loadApk` | APK(+split 目录) → 会话；返回指纹 / manifest 摘要 / 组件 / 加固探测 |
+| 装载 | `loadAar` | classes.jar + R.txt + consumer-rules.pro + jni/\<abi\>/*.so，可 `mergeInto` 并进 App 会话 |
+| 装载 | `loadDex` | 裸 classes.dex / vdex / compact-dex，可追加进已有会话 |
+| 会话 | `sessionList` / `stats` / `unload` | 忘了 sessionId 先 list；stats 看体量；unload 删登记（`keepFiles` 可选） |
+| 查询 | `searchClasses` | exact / prefix / regex，`scope=app|lib|all`，`packageFilter` |
+| 查询 | `listMembers` | 类内方法与字段，`include` 走 namePattern |
+| 查询 | `getSignature` | 一个类或成员 → smali / reflector / java / helper-ktx 四形态 + hook 起手块 + 注解（含 visibility） |
+| 查询 | `searchByString` | 常量字符串反查方法（contains/exact/regex，按命中数聚合排序） |
+| 查询 | `findImplementations` | 接口实现 / 父类子类，含传递继承链 |
+| 查询 | `xref` | callers / callees，`depth` 控制跳数 |
+| 代码 | `decompile` | `outline`（骨架）/ `smali` / `java`，`maxLines` 截断 |
+| 生成 | `matchSignature` | 只给结构条件（参数个数/类型/返回值/引用字符串）→ 候选成员 + 可粘 DSL |
+| 生成 | `diffSessions` | 两版本差分：exact-structure / structural-similarity / added / removed（入参 `sessionA`/`sessionB`） |
+| 综合 | `probe` | 一句人话问题 → 抽字面量/类名/关键词，串起 checkPacker+stats+各查询的证据包 |
+| 探测 | `checkPacker` | 识别加固与 dex 加壳证据，只识别不静默脱壳 |
+| 清单 | `listManifest` | 会话里的完整 manifest 摘要：包/版本/SDK/权限/四大组件/native 库，可按组件类型与 exported 过滤 |
+| 清单 | `findComponent` | 按名字/类型/exported 精确定位一个组件（比 listManifest 窄） |
+| 资源 | `searchResources` | resources.arsc 条目枚举（type/name/typeId）；解析失败报 NOT_FOUND 不装可用 |
+| 资源 | `resourceRefs` | 找代码里引用某资源的方法：字符串常量 + const-class 真实 xref |
+| 安全 | `resourceSecurity` | 一页安全面：exported 组件、危险权限、native 库、资源表可用性 |
+| 运维 | `doctor` | 只读缓存体检：逐会话 quick_check / schemaVersion / 体积 / 未登记 db 文件 |
 
-### Streamable HTTP（客户端只能填 URL）
+## 返回契约（每个工具都保证）
+- 成功：`{ok:true, sessionId, total, items[], truncated, hint, tool, elapsedMs, ...专有字段}`
+- 失败：`{ok:false, code, message, suggestion, hint}`
+- `items` 上限 100 条、单 item ≤ 32KB；超出置 `truncated:true`，`hint` 说明怎么收窄
+- `hint` 在成功与失败两种 envelope 里都恒存在，客户端只看一个字段就能决定下一步
+- 错误码：`INVALID_PATH` `NOT_FOUND` `CLASS_NOT_FOUND` `INVALID_REFERENCE` `SESSION_NOT_FOUND`
+  `APK_TOO_LARGE` `PACKED_DEX` `ENCRYPTED` `BACKEND_MISSING` `INTERNAL`
 
-```sh
+## 自测
+```bash
+bash build.sh                              # 打 tar 分发包
+python3 tools/make_fixture.py --out fixtures
+APK_INDEX_CACHE=$PWD/.cache python3 tests/test_tools.py
+# 真机样本（混淆目标 + 跨版本差分）：
+APK_INDEX_TEST_REAL_APK=/sdcard/Download/a.apk,/sdcard/Download/b.apk python3 tests/test_tools.py
+```
+
+## 已知边界
+- 只读静态索引，不脱壳、不改二进制；加壳 APK 只报证据与 `PACKED_DEX`
+- 无 JDK 时 `decompile(java)` 是内置可读伪 java（保留控制流与常量，不做数据流还原）
+- dex 解码是 mterp 子集，遇到未覆盖 opcode 标 `partial:true` 而不是猜
+- 未修问题清单见 `TESTPLAN.md`（真机 dex 的 mUTF-8 lone surrogate 已修，剩余为错误码与差分阈值）
+
+
+## 参数与行为速查（对齐 tools/list 实测输出）
+
+23 个工具：`loadApk` `loadAar` `loadDex` `sessionList` `unload` `stats` `checkPacker`
+`searchClasses` `listMembers` `getSignature` `searchByString` `findImplementations`
+`xref` `decompile` `matchSignature` `diffSessions` `probe`
+`listManifest` `findComponent` `searchResources` `resourceRefs` `resourceSecurity` `doctor`。
+
+### 会话与索引
+
+- `loadApk(path, splits?, fromDevice?, packageName?, backend?)`：**按 dex 内容去重**。
+  同一个 APK 无论重命名还是重打包，只要 dex 字节集合不变，拿回的是**同一个 `sessionId`**
+  和同一份索引。想强制重来用 `unload(keepFiles=false)` 再 load。
+- **参数名写错会直接拒收**（`BAD_ARGUMENT` + 有效参数列表），不再静默丢弃。以前把
+  `searchClasses` 的 `kind` 写成 `match`，regex 不生效、返回 `total=0`，看着就像
+  "这个包里根本没有"——假的空结果比崩溃更害人。注意两个搜索工具的参数名不同：
+  `searchClasses(query, kind=exact|prefix|regex)`，`searchByString(text, match=contains|exact|regex)`。
+- `loadAar(path, mergeInto?)`：读 `classes.jar` / `R.txt` / `consumer-rules.pro` /
+  `jni/**/*.so`。**`mergeInto` 是"并进宿主会话"**，宿主的 `stats` 会多出 library 类；
+  需要干净的对照会话时别用 `mergeInto`。
+- `unload(sessionId, keepFiles?)` / `sessionList()` / `stats(sessionId)` /
+  `checkPacker(sessionId)`：加固包在 `checkPacker` 里给壳特征与真实 dex 位置；
+  静态可索引类数为 0 时会明确写"索引不到不等于没有"。
+
+### 查询
+
+- `searchClasses(sessionId, query, kind=exact|prefix|regex, scope=app|library|all, packageFilter, annotatedWith, limit)`
+  —— `annotatedWith` 只回类上带该注解的（`@Keep`、`dalvik.annotation.Keep`、`Lkotlin/Metadata;` 三种写法都认），混淆包里挑名字稳定的锚点就用它。
+- `listMembers(sessionId, class, include, namePattern, scope, withStrings, limit)`
+- `getSignature(sessionId, class, member, scope)`：一个类（或一个成员）的完整外形。注解走 `annotations`：`descriptor / javaName / visibility(build|runtime|system) / values`。
+- `searchByString(sessionId, text, match=contains|exact|regex, minLen, scope, methodLimit, limit)`
+- `findImplementations(sessionId, interface|superClass, method, transitive, includeAbstract, scope, limit)`
+  —— 裸类名可用（等于该类的实现/继承查找）。
+- `xref(sessionId, method, direction=callers|callees|both, depth, scope, limit)`
+  —— `method` 支持三种写法：`com.a.b.C`（整类全部成员的引用）、`com.a.b.C->m(sig)`、
+  `com.a.b.C#m(sig)`；认不出来时报 `NOT_FOUND` 并把**原样入参**带回来，不静默返回空。
+- `matchSignature(sessionId, params, returnType, namePattern, packagePrefix, modifiers,
+  requireConstructor, invokedMethods, accessedFields, referredStrings, scope, limit)`
+  —— `params` 支持 `any` 与具体类型混写；参数个数上限 8（不是 3）；
+  `packagePrefix` 同时匹配 `com/example/demo` 与 `com.example.demo` 两种存法。
+- `decompile(sessionId, target, format=java|smali, maxLines)`：三档兜底
+  SMALI → JAVA+SMALI → SMALI，结果里标 `backend`/`format`/`truncated`；
+  JADX 不存在、崩了或导不出源码时**不会**装作成功。
+
+### 差分与聚合
+
+- `diffSessions(sessionA, sessionB, scope, minScore, limit)`：条目按 `kind` 分三种，
+  **键不一样** —— `renamed` 有 `from`/`to`/`score`/`how`/`fromDescriptor`/`toDescriptor`/
+  `packageFrom`/`packageTo`/`methodsOnlyInA`/`methodsOnlyInB`；`added`/`removed` 只有
+  `class`/`descriptor`/`superClass`/`source`/`methodCount`/`sampleMethods`。
+  同一个会话自己比是合法的，结果为空差分。
+  改名配对是启发式（同外形 + 同常量），`how` 说明依据；库类混进旧会话会搅动候选集，
+  所以对照实验要在没被 `mergeInto` 污染过的会话上做。
+- `probe(sessionId, question, target?, maxDepth?, limit)`：一句问题跑完整套侦察
+  （引号字面量→字符串检索、点号/驼峰→类检索、中文串→UI 文案检索、加固→提示脱壳）。
+  **给了 `target` 就连带 `xref` + `getSignature` + `decompile` 深挖**；问"有哪些实现类/
+  子类"时给 `implementations` 分节。深挖失败另放 `xrefErrors`，不会把整次 probe 打死。
+
+### 清单、资源与安全面（0.5.0 新增）
+
+- `listManifest(sessionId, componentType?, query?, exported?, limit)` —— 数据在 `loadApk`
+  时已写入会话 summary，查询不重新解包。`componentType=component` 看全部四类；
+  `exported=true` 只匹配清单里**显式** true 的组件，未声明（None）不算——Android 默认规则
+  和显式 false 不是一回事，安全审计上混淆这两者会给出假的干净列表。
+- `findComponent(sessionId, name?, componentType?, exported?, limit)` —— `name` 支持短名
+  后缀匹配（`.MainActivity` 和 `MainActivity` 都能命中）。
+- `searchResources(sessionId, query?, match, resourceType?, limit)` —— best-effort 解析
+  resources.arsc（纯 stdlib，条目样本上限 512）。解析不了时**报 `NOT_FOUND` + notes**，
+  不返回 ok+空列表冒充"这个包没有资源"。
+- `resourceRefs(sessionId, resource?, resourceType?, limit)` —— 两种证据：DEX 字符串常量
+  （`app_name` / `R.string.app_name`）与 const-class（`R$string` / `BuildConfig`）。
+  0 命中不等于没用到：`getIdentifier`、XML 直接引用、插件化加载都不留这两种痕迹，
+  hint 里会说明。
+- `resourceSecurity(sessionId)` —— 单条目聚合，适合跨版本 diff：包/SDK/权限/危险权限/
+  exported 组件/native 库/资源类型。
+- `doctor()` —— 只读：catalog 里每个会话的 db 存在性、`PRAGMA quick_check`、schemaVersion、
+  缓存总大小、未登记的 `.db` 文件。它**不修**任何东西；处置是 `unload` + `loadApk` 重建。
+
+注意：`loadAar(mergeInto=...)` 在 0.5.0 前会把库自己的 manifest 顶掉宿主清单；已修，
+但**旧的混合会话要 `force=true` 重建**才能拿回正确的组件与安全面。
+
+### 命令行
+
+```bash
+PYTHONPATH=src python3 -m apkindex.cli doctor fixtures/demo-v1.apk
+PYTHONPATH=src python3 -m apkindex.cli sessions
+PYTHONPATH=src python3 -m apkindex.cli tools
+PYTHONPATH=src python3 -m apkindex.cli call loadApk '{"path":"fixtures/demo-v1.apk"}'
+PYTHONPATH=src python3 -m apkindex.cli call xref '{"sessionId":"ses_xxx","method":"com.example.demo.User","direction":"callers"}'
+PYTHONPATH=src python3 -m apkindex.cli pull com.tencent.mm   # adb 在连时才可用
+# 子命令只有 tools/call/pull/doctor/sessions；具体查询一律走 call <tool> '<json>'
+```
+
+### 从设备取包（adb）
+
+没有独立脚本，走 `loadApk` 的入参：
+
+```jsonc
+{ "name": "loadApk",
+  "arguments": { "fromDevice": true, "packageName": "com.example.app",
+                 "path": "" } }
+```
+
+`fromDevice=true` 时依次 `adb shell pm path <pkg>`（拿 base.apk 与 split APK 全部路径）
+→ `adb shell dumpsys package <pkg>`（取 versionName/versionCode/minSdk/targetSdk，
+和清单里的值互相校正）→ `adb pull` 到缓存目录再索引。`ADB` 环境变量指定 adb 路径
+（默认 `adb_bin()` 的探测结果）。找不到 adb、设备没授权或超时都报 `ADB_UNAVAILABLE`
+并给出下一步；**不假装能拉到自己拉不动的东西** —— 系统分区或受保护路径请在已 root
+的机器上直接把 `/data/app/~~xxxx/.../base.apk` 当 `path` 传进来。
+
+### 自测
+
+```bash
+python3 tests/test_tools.py                    # 38 组
+APK_INDEX_TEST_REAL_APK=/path/a.apk,/path/b1.apk,/path/b2.apk python3 tests/test_tools.py
+```
+
+真机校准样本：TGAutoSign 1.2.1（1131 类，索引 ~1.6 s）、LocusMimic 2.0.0 ↔ 2.0.2
+（差分识别 12 组改名候选）。只读校验用 `APK_INDEX_CACHE` + `APK_INDEX_ALLOWED_ROOTS`
+把索引和读取范围钉在临时目录里。
+
+`apkindex.cli doctor` 的 `ok:false` 只代表依赖不齐：缺 `aapt2` / `tools/dexlib.jar` / `tools/baksmali.jar` / `tools/apktool.jar` / `jadx/bin/jadx` 时资源与反编译走降级路径，索引与结构化查询不受影响（缺什么会逐项列名，不猜）。
+
+## Streamable HTTP 传输（给只能填 URL 的客户端）
+
+```bash
 python3 -m apkindex.cli serve-http --host 127.0.0.1 --port 8732
+# 手机上更靠谱的是这个（Android root，服务不会跟着工具环境一起被回收）：
+sh tools/httpd-android.sh 8732
 ```
 
-端点 `http://127.0.0.1:8732/mcp`，stateless，`initialize` 之后不用带 session 头。
-在 Android 设备上常驻的部署办法（chroot 路径绑定、开机自启的例子）见
-**`docs/HTTP-DEPLOY.md`** 与 `tools/httpd-android.sh`。
+端点 `http://127.0.0.1:8732/mcp`：POST 一条 JSON-RPC → 200；客户端 `Accept` 里写了
+`text/event-stream` 就回 SSE 单帧（`event: message` + `data: <同一份 JSON>`），
+只要 `application/json` 就回裸 JSON —— Kotlin/Java 系的 MCP SDK 常常只认 SSE。
+通知（无 id）→ 202 空 body；批量 → 200 + 数组；`GET` → 健康检查（`Accept` 要 event-stream
+则开常驻流，只发注释帧保活）；`DELETE` → 200（回 501 会被客户端判成服务挂了）。
+`initialize` 的应答带 `Mcp-Session-Id` 与 `MCP-Protocol-Version` 头（只发不校验：
+拒绝未知会话 id 会让实现松一点的客户端直接卡死，本服务无状态可泄漏）。
+与 stdio 版共用同一个 `Server.handle()`，23 个工具、参数校验、响应体积预算完全一致。
+默认只绑回环；本机 loopback 与宿主 Android 是同一个 network namespace，
+所以手机上的 App（例：LSPilot 的 MCP 拓展 → 本地 → 新建 → Streamable HTTP）
+直接填 `http://127.0.0.1:8732/mcp` 就能连。
 
-要开鉴权：设 `APK_INDEX_MCP_TOKEN`，客户端带 `Authorization: Bearer <token>` 或 `?token=`。
-`GET /mcp` 健康检查故意不需要 token，方便启动器探活。
+## 鉴权、状态码与完整部署说明
 
-## 17 个工具
+见 **`docs/HTTP-DEPLOY.md`**：启动器与开机自启、chroot 路径绑定、路由与帧的选择、
+JSON-RPC → HTTP 状态码映射表、四个大小上限、token 鉴权（`APK_INDEX_MCP_TOKEN`，
+非回环地址无 token 直接拒启）、`decompile` 的 `auto` 降级契约、curl 全流程、排障表。
 
-| 组 | 工具 | 必填 | 常用参数 |
-|---|---|---|---|
-| 装载 | `loadApk` | `path` | `splits` `maxApkBytes` `force` `fromDevice` `packageName` `backend` |
-| | `loadAar` | `path` | `mergeInto` `backend` |
-| | `loadDex` | `path` | `sessionId` `format` `source` |
-| 会话 | `sessionList` | — | — |
-| | `unload` | `sessionId` | `keepFiles` |
-| | `stats` | `sessionId` | — |
-| 结构 | `searchClasses` | `sessionId` `query` | `kind` `scope` `packageFilter` `annotatedWith` `limit` |
-| | `listMembers` | `sessionId` `class` | `include` `namePattern` `withStrings` |
-| | `getSignature` | `sessionId` `class` | `member` `scope` |
-| | `findImplementations` | `sessionId` + `interface`/`superClass`/`method` | `transitive` `includeAbstract` |
-| | `matchSignature` | `sessionId` `signature` | `params` `returnType` `modifiers` `referredStrings` `accessedFields` `invokedMethods` `namePattern` `packagePrefix` `requireConstructor` `minScore` |
-| 内容 | `searchByString` | `sessionId` `text` | `match` `scope` `methodLimit` `minLen` |
-| | `xref` | `sessionId` `method` | `direction` `depth` |
-| | `decompile` | `sessionId` `target` | `format` `maxLines` |
-| 版本 | `diffSessions` | `sessionA` `sessionB` | — |
-| 判定 | `checkPacker` | `sessionId` | — |
-| 编排 | `probe` | `sessionId` `question` | `target` `maxDepth` `limit` |
+三条最容易踩的先放在这里：
 
-完整 schema 以运行时为准（这张表会落后于代码）：
+- 业务错误不占状态码：`tools/call` 成败都回 `200`，看信封里的 `ok` / `code`。
+- `tools/call` 的 JSON-RPC `method` 恒为 `tools/call`，工具名在 `params.name`。
+  把工具名当 method 发会得到 `404 / -32601`。
+- `GET /mcp` 免鉴权，是健康检查；它不含任何包内容。
 
-```sh
-python3 -m apkindex tools        # 全量 inputSchema + annotations + outputSchema
-```
+## HTTP 帧的选择
 
-用熟了会省时间的几个点：
+`Accept` 里同时有 `application/json` 与 `text/event-stream`（ktor/OkHttp 客户端的默认写法）时，
+服务端回**裸 JSON**；只有客户端只接受 `text/event-stream` 才回 SSE 单帧（`event: message` + `data: <同一份 JSON>`）。
+原因是有些客户端一进 SSE 模式就按"长流"读，单条响应要等流结束才交给上层，白吃一个 request timeout。
+`--verbose` 会把每个请求的方法/工具名、字节数和超过 500ms 的耗时打到 stderr，
+慢在哪个工具、有没有卡在锁上，看一眼日志就知道。
 
-- **`scope`**：`app`＝目标自身代码，`library`＝注入进来的库，`system`＝框架与 rom，`all`（默认）。
-  查混淆目标先收紧成 `app`，否则 `kotlin.*` 的噪声会淹没结果。
-- **`kind`**：`prefix`（默认）/ `exact` / `regex`。前缀查不到别急着下"不存在"的结论，换 `regex` 再试。
-- **`member` 留空**＝只看类级签名（含类上的注解）；给了成员名才附带方法体字符串与方法注解。
-  构造方法是 `<init>`，静态初始化器是 `<clinit>`。
-- **`annotatedWith`**：`@Keep` / `dalvik.annotation.Keep` / `Ldalvik/annotation/Keep;` 三种写法都认。
-  只命中类级注解；方法上的注解走 `getSignature`。
-- **`matchSignature`** 是结构相似度：混淆之后名字靠不住，用"参数形状 + 引用的字符串 + 修饰符"捞目标，
-  位置通配写 `"any"`。
-- **`decompile` 的 `format=auto`** 是刻意的：jadx → baksmali → 索引重建视图逐级降级，
-  最差也给你一份能读的 outline，而不是报错。
+## 输出：人读文本 + 机器 JSON 双通道
 
-## 返回契约
+`tools/call` 的结果给两份：
 
-```json
-{"ok": true, "items": [], "total": 132, "hint": "...", "ms": 41}
-```
+* `content[0].text` —— 给人读的渲染（`src/apkindex/render.py`）：一行结论 + 对齐条目 +
+  一句下一步；空结果会解释"为什么可能是空"。descriptor / smali / reflector 这些
+  干活要用的字段一个都不省，因为有的客户端只把 text 喂给模型。
+* `structuredContent` —— 完整 envelope JSON，字段与早期版本一致，给程序解析。
 
-- `total` 是**全量命中数**，`items` 只是当页（默认 50，硬上限 200）。被截断一定写在 `hint` 里。
-- 单条超过 2KB 会被摘要化（例：`@Metadata` 的超长 `d1` 换成 `{"_blob":53,"_sha1":"..."}`），
-  整包响应硬上限 32KB。**要原文走 `decompile`**，别在注解字段上较真。
-- 每个工具都声明 `annotations`（`readOnlyHint` / `destructiveHint` / `idempotentHint` /
-  `openWorldHint`）。只有 `unload` 是破坏性的，删的是自己的索引缓存。客户端可以据此放行，
-  不用靠"看起来像查询"来猜。
-- 参数名写错会直接报 `BAD_ARGUMENT` 并列出有效参数。以前会静默丢参、返回假的 `total=0`
-  —— 那种"假空结果"比崩溃害人得多。
+以前两份内容都是同一坨 JSON，客户端常常重复显示两遍，人读很费劲；现在 text 走渲染，
+JSON 只留一份。传输层不变：客户端 Accept 里同时允许 JSON 就回裸 JSON，只要 SSE 才回帧。
 
-### 错误码
-
-| 码 | 含义与对策 |
-|---|---|
-| `BAD_ARGUMENT` | 参数名/正则/枚举不合法，响应里带有效参数清单 |
-| `SESSION_NOT_FOUND` | sessionId 不存在或前缀不唯一，先 `sessionList` |
-| `APK_TOO_LARGE` | 超过 `maxApkBytes`；调大，或用 `loadDex` 只导需要的那几个 dex |
-| `UNSUPPORTED_FORMAT` | 加固体里的内嵌 dex 读不动：先 apktool / `uncompress_dex` / `vdexExtract` 提出来，再 `loadDex` |
-| `PATH_NOT_ALLOWED` | 路径不在 `APK_INDEX_ALLOWED_ROOTS` 白名单内 |
-| `INDEX_STALE` | 索引 schema 版本落后（老库存的值可能是错的），`loadApk(force=true)` 重建 |
-
-## 配置
-
-| 环境变量 | 作用 |
-|---|---|
-| `APK_INDEX_CACHE` | 索引落盘位置。**建议显式设**，不设时解析顺序会随 cwd 漂 |
-| `APK_INDEX_ALLOWED_ROOTS` | 可读根目录白名单（`:` 分隔）。默认放开 `/data/local/tmp`、`/sdcard` 等常见位置 |
-| `APK_INDEX_MCP_TOKEN` / `APK_INDEX_TOKEN` | 开 HTTP 鉴权 |
-| `APK_INDEX_BACKEND` | `auto`（默认）/ `builtin` / `androguard` / `dexlib2` |
-| `APK_INDEX_JADX_HOME` | 装了就出 Java 反编译视图 |
-| `APK_INDEX_BAKSMALI_JAR` / `APK_INDEX_DEXLIB2_JAR` | 装了就出真 smali |
-| `ADB` | `loadApk(fromDevice=true)` 用哪条 adb |
-
-```sh
-python3 -m apkindex env          # 当前生效的 roots / 缓存 / 引擎 / 后端
-python3 -m apkindex.cli doctor
-```
-
-`doctor` 报 `ok: false` 只代表**可选**依赖缺失（aapt2 / baksmali / dexlib2 / apktool），
-索引与结构化查询不受影响。
-
-## 三个常见任务
-
-**改 UI 文案，找到该挂的回调**
-
-```sh
-searchByString  {"sessionId":"t","text":"登录中","minLen":2}
-getSignature    {"sessionId":"t","class":"<上一步的类>","member":"<方法>"}
-decompile       {"sessionId":"t","target":"<类#方法(sig)>","maxLines":400}
-```
-
-**目标是混淆的，按结构而不是名字找**
-
-```sh
-matchSignature  {"sessionId":"t","signature":"Lx/a;->b(Landroid/content/Context;)V",
-                 "modifiers":["static"],"referredStrings":["token"],"minScore":0.6}
-diffSessions    {"sessionA":"旧版","sessionB":"新版"}
-```
-
-**动手前先判加固**
-
-```sh
-loadApk → checkPacker →（packed=true 就先解壳，拿到内嵌 dex 再 loadDex）
-```
-
-判成 `packed: true` 时**停手**。那时候选里全是壳代码，写进去的 hook 永远不执行。
-
-## 测试
-
-```sh
-cd apk-index
-python3 -m pytest -q tests/            # 61 个用例（tools 33 + render 10 + httpd 18）
-python3 -m apkindex selftest           # 协议自检：握手、工具表、真实调用、错误预算
-```
-
-测试只依赖 `fixtures/` 下的**合成**样本（自己写的 dex 生成器造出来的，含一个假壳包），
-不联网、不需要真机、不需要任何第三方 App。
-
-手上有真实样本想做回归（可选，不入库）：
-
-```sh
-APK_INDEX_TEST_REAL_APK=/path/a.apk,/path/b.apk python3 -m pytest -q tests/test_tools.py
-```
-
-细节见 `docs/TESTING.md`。
-
-## 目录结构
-
-```text
-src/apkindex/
-  apkio.py      APK/zip 与 split 合并          axml.py     二进制 manifest 解码
-  dex.py        dex 结构解析（含注解表）        dexwrite.py 合成 dex（测试与 fixture 用）
-  index.py      SQLite 会话库、schema 与自愈    loaders.py  loadApk/Aar/Dex 主流程
-  queries.py    17 个工具的实现                 render.py   人读文本视图
-  signature.py  各种写法互转（Reflector/smali/Java/descriptor）
-  dsl.py        模块侧 DSL 生成（hook 起手块）  packer.py   加固判定
-  decomp.py     反编译引擎调度与降级            backends.py 索引后端选择
-  envelope.py   返回信封与预算裁剪              httpd.py    Streamable HTTP 传输
-  server.py     工具表与 dispatch               cli.py      命令行
-tests/          单元 + 协议 + 渲染回归          fixtures/   合成样本（含假壳包）
-tools/          自检客户端、fixture 生成器、Android 部署例子
-docs/           HTTP-DEPLOY.md  传输契约与状态码  TESTING.md  测试与样本回归
-```
-
-## 边界
-
-- 只索引**你有权分析**的文件。工具不做解密、不做脱壳、不绕过任何保护；遇到加固只会告诉你
-  "静态结构不可信"，解壳是你自己的事。
-- 全程离线。除了 `loadApk(fromDevice=true)` 会调你本机的 adb，代码里没有任何网络出站。
-- 不修改被分析的文件。唯一写入的是自己的 SQLite 缓存目录。
-- 加固体内的内嵌 dex 需要你先自己提出来（错误码里给了三条路子）。
-- 索引是按包名+sha256 缓存的结构数据。要清干净：`unload` 或直接删缓存目录。
-
-## 版本
-
-当前 `0.4.4`，索引 schema 版本 6（旧库会被 `INDEX_STALE` 拒用，重建即可）。
-变更历史见 **`CHANGELOG.md`** —— 里面记了不少 dex 布局上的坑，做类似解析的话值得读。
-
-## 许可
-
-MIT。见 `LICENSE` 与 `AUTHORS`。
+要自定义某个工具的样子：`render.RENDERERS["toolName"] = fn`（fn 收 envelope 返回字符串）；
+没注册的工具自动走 `_r_generic`，至少是 key 行 + 编号条目，不会退回裸 JSON。

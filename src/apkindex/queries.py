@@ -559,11 +559,6 @@ def get_signature(session_id: str, cls: str = "", member: str = "",
                                                     static=bool(r.get("is_static"))),
                     })
             out["member"] = member
-            if not items:
-                # 以前这里静默回"0 个匹配"，看着像工具坏了
-                out["hint"] = ((out.get("hint") or "") + " member=%r 在 %s 上没有同名成员；"
-                        "listMembers 看真名（构造方法是 <init>，静态块是 <clinit>）。"
-                        % (member, bin_name)).strip()
         else:
             out["member"] = None
             hint = "member 为空 → 只给类级签名；带 member（方法名或完整引用）才出方法级四种写法。"

@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 
 NAME = "apk-index"
-VERSION = "0.4.4"
+VERSION = "0.5.1"
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 DEFAULT_LIMIT = 50

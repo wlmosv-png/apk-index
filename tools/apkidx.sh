@@ -1,17 +1,17 @@
 #!/bin/sh
-# apk-index 统一入口（零安装的仓库内跑法）： PYTHONPATH 指到 src，直接 -m apkindex。
-# 需要环境里有 python3 >= 3.11（Android 自带的 shell 没有）；
-# 装成包之后可以用 `apk-index` 命令，见 bin/apk-index 与 README。
+# apk-index 统一入口。代码跑在 Linux 工具环境（Android shell 没有 python3）。
+# 放在仓库内（/data/local/tmp 是 Android 与 Linux 两个环境唯一共享的地方），
+# 随 build.sh 一起打包；skill 里只引用这个路径，别把脚本放进 /data/data。
 # 用法: apkidx.sh <tools|env|selftest|version|doctor|sessions|pull|load|sid|call> [args...]
 set -e
 
-ROOT="${APK_INDEX_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+ROOT="${APK_INDEX_ROOT:-/data/local/tmp/apk-index}"
 SRC="$ROOT/src"
 PY="${APK_INDEX_PY:-python3}"
 
 if [ ! -d "$SRC/apkindex" ]; then
   echo "apk-index 未部署: 找不到 $SRC/apkindex" >&2
-  echo "把仓库放到 $ROOT，或设 APK_INDEX_ROOT=<仓库绝对路径>" >&2
+  echo "解包: tar xzf /storage/emulated/0/Download/apk-index.tar.gz -C /data/local/tmp" >&2
   exit 3
 fi
 

@@ -16,8 +16,54 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+
+try:
+    import fcntl as _fcntl
+except ImportError:          # Windows 兜底：退化为进程内锁
+    _fcntl = None
+
+_OWNER_LOCK = threading.RLock()
+
+
+@contextmanager
+def owner_write_lock():
+    """catalog.db 跨进程写锁。SQLite WAL 只保证不坏库，不保证两个进程同时
+    upsert 同一行时不互相覆盖业务字段（owner 表）——补一把文件锁最稳。"""
+    if _fcntl is None:
+        with _OWNER_LOCK:
+            yield
+        return
+    lock_path = os.path.join(os.path.dirname(catalog().path), ".catalog.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        yield
+    finally:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
+def session_write_lock(db_path: str):
+    """单个索引 db 的跨进程写锁：两个进程同时 load 同一新包会写同一文件。
+    锁文件放 db 旁边（<db>.lock），flock 随进程退出自动释放。"""
+    if _fcntl is None:
+        yield
+        return
+    lock_path = db_path + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        yield
+    finally:
+        _fcntl.flock(fd, _fcntl.LOCK_UN)
+        os.close(fd)
+
 
 from .config import ApkIndexError, ErrorCode, settings, iso
 
@@ -299,7 +345,7 @@ class Catalog:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self.conn = sqlite3.connect(self.path, timeout=15.0,
                                     check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=MEMORY")
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("""
           CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
@@ -319,6 +365,19 @@ class Catalog:
             meta_json TEXT DEFAULT '{}'
           )""")
         self.conn.execute("CREATE INDEX IF NOT EXISTS ix_sessions_sha ON sessions(sha256)")
+        self.conn.execute("""
+          CREATE TABLE IF NOT EXISTS session_owners (
+            session_id TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            created_at TEXT,
+            PRIMARY KEY (session_id, owner)
+          )""")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS ix_sowners_owner ON session_owners(owner)")
+        # 老库迁移：历史会话归 default 拥有者（无 session id 的客户端可见）
+        self.conn.execute(
+            "INSERT OR IGNORE INTO session_owners(session_id, owner, created_at) "
+            "SELECT session_id, 'default', ? FROM sessions", (iso(),))
+        self.conn.commit()
 
     def find_by_sha(self, sha: str):
         row = self.conn.execute(
@@ -360,11 +419,19 @@ class Catalog:
             [kw[c] for c in cols])
         self.conn.commit()
 
-    def list(self):
-        cur = self.conn.execute(
-            "SELECT session_id, sha256, kind, label, pkg, version_name, version_code,"
-            " db_path, created_at, index_ms, backend, packed, sources_json "
-            "FROM sessions ORDER BY created_at DESC")
+    def list(self, owner: str | None = None):
+        if owner is None:
+            cur = self.conn.execute(
+                "SELECT session_id, sha256, kind, label, pkg, version_name, version_code,"
+                " db_path, created_at, index_ms, backend, packed, sources_json "
+                "FROM sessions ORDER BY created_at DESC")
+        else:
+            cur = self.conn.execute(
+                "SELECT s.session_id, s.sha256, s.kind, s.label, s.pkg, "
+                "s.version_name, s.version_code, s.db_path, s.created_at, "
+                "s.index_ms, s.backend, s.packed, s.sources_json "
+                "FROM sessions s JOIN session_owners o ON o.session_id = s.session_id "
+                "WHERE o.owner=? ORDER BY s.created_at DESC", (owner,))
         out = []
         for r in cur.fetchall():
             d = dict(zip(["sessionId", "sha256", "kind", "label", "pkg",
@@ -378,9 +445,50 @@ class Catalog:
             out.append(d)
         return out
 
-    def delete(self, session_id: str):
-        self.conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
-        self.conn.commit()
+    def register_owner(self, session_id: str, owner: str) -> None:
+        with owner_write_lock():
+            self.conn.execute(
+                "INSERT OR IGNORE INTO session_owners(session_id, owner, created_at) "
+                "VALUES(?,?,?)", (session_id, owner, iso()))
+            self.conn.commit()
+
+    def unregister_owner(self, session_id: str, owner: str) -> bool:
+        """解除 owner 对该会话的引用；返回是否还有其他 owner 引用（决定是否删文件）。"""
+        with owner_write_lock():
+            self.conn.execute(
+                "DELETE FROM session_owners WHERE session_id=? AND owner=?",
+                (session_id, owner))
+            self.conn.commit()
+            row = self.conn.execute(
+                "SELECT COUNT(*) FROM session_owners WHERE session_id=?",
+                (session_id,)).fetchone()
+            return int(row[0] or 0) > 0
+
+    def owner_count(self, session_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM session_owners WHERE session_id=?",
+            (session_id,)).fetchone()
+        return int(row[0] or 0)
+
+    def delete(self, session_id: str, owner: str | None = None) -> bool:
+        """删除会话登记。owner 非空时只允许该 owner 删除自己的引用；
+        返回是否真正删除了 sessions 行（无其他 owner 引用时）。"""
+        with owner_write_lock():
+            if owner is not None:
+                self.conn.execute(
+                    "DELETE FROM session_owners WHERE session_id=? AND owner=?",
+                    (session_id, owner))
+                self.conn.commit()
+                row = self.conn.execute(
+                    "SELECT COUNT(*) FROM session_owners WHERE session_id=?",
+                    (session_id,)).fetchone()
+                if int(row[0] or 0) > 0:
+                    return False
+            self.conn.execute(
+                "DELETE FROM session_owners WHERE session_id=?", (session_id,))
+            self.conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+            self.conn.commit()
+            return True
 
     def close(self):
         self.conn.close()
@@ -434,10 +542,18 @@ class IndexWriter:
         self.backend = backend
         self.db_path = db_path_for(session_id)
         self.t0 = time.time()
-        _heal_if_broken(self.db_path)   # journal=OFF 提速的代价：半截崩溃会留下坏库
-        self.conn = init_db(self.db_path)
-        self.conn.execute("PRAGMA journal_mode=OFF")
-        self.conn.execute("PRAGMA synchronous=OFF")
+        # 跨进程写锁：两个客户端同时索引同一个新包会写同一个 db 文件，
+        # journal=OFF 提速下并发写会互相踩坏。锁随实例持有、close 释放。
+        self._write_lock = session_write_lock(self.db_path)
+        self._write_lock.__enter__()
+        try:
+            _heal_if_broken(self.db_path)   # journal=OFF 提速的代价：半截崩溃会留下坏库
+            self.conn = init_db(self.db_path)
+            self.conn.execute("PRAGMA journal_mode=OFF")
+            self.conn.execute("PRAGMA synchronous=OFF")
+        except Exception:
+            self._write_lock.__exit__(None, None, None)
+            raise
         self.totals = BuildTotals()
         self._string_ids: dict[str, int] = {}
         self._ref_ids: dict[tuple, int] = {}
@@ -667,6 +783,10 @@ class IndexWriter:
     def close(self):
         self.conn.commit()
         self.conn.close()
+        try:
+            self._write_lock.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------- session db

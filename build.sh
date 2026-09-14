@@ -8,8 +8,8 @@ cd "$(cd "$(dirname "$0")" && pwd)"
 OUT="${1:-dist/apk-index.tar.gz}"
 mkdir -p "$(dirname "$OUT")"
 
-ITEMS=(src tools tests fixtures docs bin README.md CHANGELOG.md LICENSE AUTHORS
-       build.sh pyproject.toml .gitignore)
+ITEMS=(src tools tests fixtures README.md CHANGELOG.md ACCEPTANCE.md TESTPLAN.md
+       build.sh pyproject.toml)
 MISSING=()
 KEEP=()
 for it in "${ITEMS[@]}"; do

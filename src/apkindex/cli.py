@@ -143,7 +143,7 @@ def cmd_sessions(_: list[str]) -> int:
 
 
 def cmd_serve_http(argv: list[str]) -> int:
-    """起 Streamable HTTP 版 MCP，给手机上只能填 URL 的客户端用。"""
+    """起 Streamable HTTP 版 MCP，给手机上只能填 URL 的客户端（LSPilot 等）用。"""
     host, port, verbose = "127.0.0.1", 8732, False
     i = 0
     while i < len(argv):

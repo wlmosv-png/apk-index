@@ -1,4 +1,4 @@
-"""Generate every fixture used by tests/ -- no network, no JVM.
+"""Generate every fixture used by tests/ and TESTPLAN.md -- no network, no JVM.
 
 Outputs under ``--out`` (default ``fixtures/``):
 

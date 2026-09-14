@@ -167,7 +167,7 @@ def main(argv: list[str]) -> int:
         call(argv[2], args, quiet=False)
         return 0
     if cmd == "demo":
-        return demo(argv[2] if len(argv) > 2 else "fixtures/demo-v1.apk")
+        return demo(argv[2] if len(argv) > 2 else "/data/local/tmp/lspilot-real.apk")
     print(__doc__)
     return 2
 

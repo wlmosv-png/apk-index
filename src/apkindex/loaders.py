@@ -18,6 +18,7 @@ from . import packer as packer_mod
 from .config import (ApkIndexError, DEFAULT_LIMIT, ErrorCode, HARD_LIMIT,
                      iso, resolve_input_path, settings)
 from .dex import ACC_STATIC, ClassInfo, CodeInfo, DexFileData, FieldInfo, MethodInfo
+from . import ctx as owner_ctx
 from .index import (SCHEMA_VERSION, IndexWriter, SessionDB, catalog, connect,
                     meta_get)
 from .signature import normalize_desc
@@ -249,6 +250,7 @@ def _register(sid: str, summary: dict, db_path: str, kind: str, backend_name: st
         meta_json=json.dumps({"counts": summary.get("counts", {}),
                               "dexCount": len(summary.get("dexes", []))},
                              ensure_ascii=False))
+    catalog().register_owner(sid, owner_ctx.current_owner())
 
 
 # ------------------------------------------------------------------- loadApk
@@ -309,6 +311,7 @@ def load_apk(path: str, from_device: bool = False, package_name: str = "",
     if hit:
         row = catalog().find_by_id(hit)
         if row and _index_usable(row):
+            catalog().register_owner(hit, owner_ctx.current_owner())
             summary = _read_summary(row["dbPath"])
             return _result(row, summary, already_loaded=True,
                            elapsed_ms=(time.time() - t0) * 1000.0)
@@ -551,6 +554,14 @@ def load_aar(path: str, merge_into: str = "", backend: str = "", maxApkBytes: in
         summary["aarMerges"] = prev.get("aarMerges", [])
         summary["pkg"] = prev.get("pkg") or pkg
         summary["counts"] = counts
+        # 库产物并入宿主时，清单/组件/native 库以宿主 APK 为准：
+        # AAR 的 manifest 是库自己的（没有组件），顶掉宿主清单会让
+        # listManifest / findComponent / resourceSecurity 全看到库的摘要。
+        if prev.get("manifest"):
+            summary["manifest"] = prev["manifest"]
+        if prev.get("components"):
+            summary["components"] = prev["components"]
+        summary["nativeLibs"] = (prev.get("nativeLibs") or []) + natives
     w.set_meta({"summary": summary, "schemaVersion": SCHEMA_VERSION,
                 "sha256": summary.get("sha256"), "counts": counts})
     db_path = w.db_path
@@ -805,7 +816,8 @@ def _resolve_by_label(label: str) -> dict:
 
 # ------------------------------------------------------- list/unload/stats
 def session_list(**_kw) -> dict:
-    rows = catalog().list()
+    owner = owner_ctx.current_owner()
+    rows = catalog().list(owner=owner)
     items = []
     for r in rows:
         db_ok = bool(r["dbPath"]) and os.path.exists(r["dbPath"])
@@ -818,15 +830,19 @@ def session_list(**_kw) -> dict:
                       "sources": r["sources"], "createdAt": r["createdAt"]})
     return {"ok": True, "sessionId": None, "total": len(items), "items": items,
             "truncated": False,
-            "hint": f"cache={settings().cache_dir}；用 stats(sessionId) 看细节。"}
+            "hint": f"cache={settings().cache_dir}；owner={owner}（只显示本客户端的会话，"
+            f"同包可 loadApk 幂等复用）。用 stats(sessionId) 看细节。"}
 
 
 def unload(session_id: str, keep_files: bool = False, **_kw) -> dict:
+    owner = owner_ctx.current_owner()
     row = catalog().find_by_id(session_id) or _resolve_by_label(session_id)
     sid = row["session_id"]
     db_path = row["dbPath"]
+    # 只允许解除当前 owner 的引用；其他 owner 还在用就不动文件
+    still_used = catalog().unregister_owner(sid, owner)
     removed = []
-    if not keep_files and db_path:
+    if not keep_files and db_path and not still_used:
         real = os.path.realpath(db_path)
         base = os.path.realpath(settings().index_dir())
         if not real.startswith(base + os.sep):
@@ -837,11 +853,17 @@ def unload(session_id: str, keep_files: bool = False, **_kw) -> dict:
             if os.path.exists(f):
                 os.remove(f)
                 removed.append(f)
-    catalog().delete(sid)
+    catalog().delete(sid, owner=owner)
+    hint = "已解除本客户端对该会话的引用"
+    if still_used:
+        hint += "；还有其他客户端在用，索引文件保留。"
+    elif removed:
+        hint += "；索引文件已删除（源文件从未被修改）。重新 loadApk 会重建。"
+    else:
+        hint += "；索引文件保留（keepFiles 或仍被引用）。"
     return {"ok": True, "sessionId": sid, "total": len(removed),
             "items": [{"deleted": f} for f in removed],
-            "truncated": False,
-            "hint": "会话与索引已删除（源文件从未被修改）。重新 loadApk 会重建索引。"}
+            "truncated": False, "hint": hint}
 
 
 def stats(session_id: str = "", **_kw) -> dict:

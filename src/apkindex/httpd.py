@@ -1,4 +1,4 @@
-"""Streamable HTTP 传输 —— 给只能填 URL 的 MCP 客户端（手机 App 内的客户端就是这种）。
+"""Streamable HTTP 传输 —— 给只能填 URL 的 MCP 客户端（手机上的 LSPilot 就是这种）。
 
 只依赖标准库。协议行为与 stdio 版完全一致，共用 server.Server.handle()：
 
@@ -28,6 +28,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import ctx as owner_ctx
 from .server import (INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST,
                      JSONRPC_PROTOCOL_VERSION, METHOD_NOT_FOUND, PARSE_ERROR,
                      Server, VERSION, tool_specs)
@@ -77,7 +78,7 @@ def _wants_sse(accept: str) -> bool:
 
     单条响应用裸 JSON 是合规且更省事的写法。有的 Kotlin/ktor 客户端一进
     text/event-stream 就切到"等流结束"的读法，白等一个 request_timeout；
-    实测 ktor-client 系客户端 就是这个行为。所以：两边都接受 → JSON。
+    实测 LSPilot(ktor-client) 就是这个行为。所以：两边都接受 → JSON。
     """
     a = (accept or "").lower()
     if "application/json" in a or a.strip() in ("*/*", ""):
@@ -236,6 +237,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(404, INVALID_REQUEST, f"只有 {MCP_PATH} 提供 MCP")
         if not _authorized(getattr(self.server, "token", ""), self.headers):
             return self._unauth()
+        # 租户隔离：MCP-Session-Id 请求头 -> owner。客户端 initialize 时服务端
+        # 发的 Mcp-Session-Id 会随后续请求带回；没带的（裸 curl 等）归 default。
+        sid_hdr = (self.headers.get("MCP-Session-Id") or "").strip()
+        owner_ctx.set_owner(sid_hdr if len(sid_hdr) <= 64 else sid_hdr[:64])
         hdr = " | ".join("%s=%s" % (h, self.headers.get(h)) for h in PROBE_HEADERS
                          if self.headers.get(h))
         self._note("POST " + hdr)

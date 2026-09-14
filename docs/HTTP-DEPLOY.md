@@ -8,7 +8,7 @@
 | | stdio（`python -m apkindex.cli` / `apkindex.cli call`） | HTTP（`/mcp`） |
 |---|---|---|
 | 客户端能自己拉起进程 | 合适 | 不必要 |
-| 客户端只能填一个 URL（手机 App 内的客户端） | 做不到 | **就用这个** |
+| 客户端只能填一个 URL（手机上的 LSPilot 就是） | 做不到 | **就用这个** |
 | 索引缓存 | 共用同一份 `APK_INDEX_CACHE` | 同上 |
 
 两者共用 `server.Server.handle()`，协议行为、工具集、返回信封**完全一致**。
@@ -20,13 +20,13 @@
 
 ```sh
 # Android root shell 执行
-sh tools/httpd-android.sh 8732
+sh /data/local/tmp/apk-index/tools/httpd-android.sh 8732
 ```
 
 这个启动器做四件事，顺序固定：
 
 1. `mount --bind` 三条路径进 chroot（**幂等**，已挂就跳过）：
-   - `$APK_INDEX_HOME` → 容器内 `/apk`（代码 + 缓存）
+   - `/data/local/tmp/apk-index` → 容器内 `/apk`（代码 + 缓存）
    - `/data/local/tmp` → 同路径
    - `/storage/emulated/0` → 同路径
    目的是让客户端填的路径在容器内外指向同一个文件，不用猜容器内路径。
@@ -40,12 +40,12 @@ sh tools/httpd-android.sh 8732
 ### 开机自启
 
 ```
-<SERVICE.D>/apk_index_httpd.sh   # 等 boot_completed + rootfs 可用后调启动器
-$LOG_DIR/service-boot.log    # 自启记录
-$LOG_DIR/httpd-android.log   # 服务自己的访问日志（verbose）
+/data/adb/service.d/apk_index_httpd.sh   # 等 boot_completed + rootfs 可用后调启动器
+/data/local/tmp/.gen/service-boot.log    # 自启记录
+/data/local/tmp/.gen/httpd-android.log   # 服务自己的访问日志（verbose）
 ```
 
-依赖 宿主提供的 Alpine rootfs（在 App 私有目录下）。**卸载 宿主终端环境 或清它的数据，服务起不来**，
+依赖 Eta 的 Alpine rootfs（在 App 私有目录下）。**卸载 Eta 或清它的数据，服务起不来**，
 索引缓存也会跟着没 —— 但已索引的包本身不受影响，重装后 `loadApk` 重建即可。
 
 ## 路由与帧
@@ -63,7 +63,7 @@ $LOG_DIR/httpd-android.log   # 服务自己的访问日志（verbose）
 健康检查长这样（**不要 token**，启动器靠它探活）：
 
 ```json
-{"ok": true, "name": "apk-index", "version": "0.4.4", "transport": "streamable-http",
+{"ok": true, "name": "apk-index", "version": "0.5.0", "transport": "streamable-http",
  "endpoint": "/mcp", "tools": 17, "maxRequestBytes": 4194304,
  "sessionMode": "stateless", "auth": "none"}
 ```
@@ -75,7 +75,7 @@ $LOG_DIR/httpd-android.log   # 服务自己的访问日志（verbose）
 
 ### 为什么默认回 JSON 而不是 SSE
 
-规范允许两种。实测 ktor-client一进 `text/event-stream`
+规范允许两种。实测 ktor-client（LSPilot 用的）一进 `text/event-stream`
 就切成"等流结束"的读法，白等一个 request_timeout。所以：**两边都接受 → JSON**，
 只有明确只收 SSE 的客户端才给 SSE。
 
@@ -120,7 +120,7 @@ $LOG_DIR/httpd-android.log   # 服务自己的访问日志（verbose）
 要加 token：
 
 ```sh
-APK_INDEX_MCP_TOKEN='一串随机值' sh tools/httpd-android.sh 8732
+APK_INDEX_MCP_TOKEN='一串随机值' sh /data/local/tmp/apk-index/tools/httpd-android.sh 8732
 ```
 
 （`APK_INDEX_TOKEN` 是等价的短别名。）生效后：
@@ -194,8 +194,8 @@ curl -s -X POST http://127.0.0.1:8732/mcp -H 'Content-Type: application/json' \
 | 启动器把自己的 shell 一起杀了 | 你的命令行里含 `apkindex import httpd` 字面量，被它的 kill 循环按 cmdline 匹配上。用 `apkindex[ ]import` 这类带通配/字符类的写法 |
 | 客户端报路径不存在 | 容器内看不见宿主路径。确认三条 `mount --bind` 在：`grep ' apk$|/data/local/tmp' /proc/mounts` |
 | 服务过一会儿没了 | 从 Linux 工具环境起的进程会被按进程组回收。改用 `tools/httpd-android.sh` |
-| 端口 0 条监听 | `sh tools/httpd-android.sh 8732` 重启；日志 `$LOG_DIR/httpd-android.log` |
-| 401 但确定设了 token | 环境变量要在**启动服务的那个 shell**里；自启脚本走 `<SERVICE.D>/`，改那里 |
+| 端口 0 条监听 | `sh tools/httpd-android.sh 8732` 重启；日志 `/data/local/tmp/.gen/httpd-android.log` |
+| 401 但确定设了 token | 环境变量要在**启动服务的那个 shell**里；自启脚本走 `/data/adb/service.d/`，改那里 |
 
 ## 已知缺口
 
